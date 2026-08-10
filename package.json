@@ -1,0 +1,56 @@
+{
+  "name": "llm-save-merge",
+  "displayName": "LLM Save Merge",
+  "description": "When a file changes on disk underneath an unsaved editor buffer, 3-way merge the two versions with an LLM instead of surfacing VS Code's save-conflict dialog.",
+  "version": "0.1.0",
+  "publisher": "DJRHails",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "llmSaveMerge.mergeActiveFile",
+        "title": "LLM Save Merge: Merge disk changes into active file"
+      }
+    ],
+    "configuration": {
+      "title": "LLM Save Merge",
+      "properties": {
+        "llmSaveMerge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically LLM-merge disk changes into dirty editor buffers."
+        },
+        "llmSaveMerge.model": {
+          "type": "string",
+          "default": "claude-sonnet-5",
+          "description": "Model id passed to `claude --print --model`."
+        },
+        "llmSaveMerge.claudePath": {
+          "type": "string",
+          "default": "claude",
+          "description": "Path to the claude CLI binary (~/.local/bin is appended to PATH when spawning)."
+        },
+        "llmSaveMerge.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "Kill the merge call after this many milliseconds and fall back to the normal conflict dialog."
+        },
+        "llmSaveMerge.maxFileBytes": {
+          "type": "number",
+          "default": 400000,
+          "description": "Skip files larger than this (bytes); the normal conflict dialog applies instead."
+        }
+      }
+    }
+  }
+}
