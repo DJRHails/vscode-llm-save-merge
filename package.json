@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "DJRHails",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DJRHails/vscode-llm-save-merge.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
