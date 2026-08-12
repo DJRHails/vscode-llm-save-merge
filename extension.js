@@ -10,6 +10,7 @@ const { llmMerge } = require('./merge');
 const DEBOUNCE_MS = 1200;
 const SELF_SAVE_SUPPRESS_MS = 2500;
 const MAX_STALE_RETRIES = 2;
+const POLL_MS = 2000;
 
 const output = vscode.window.createOutputChannel('LLM Save Merge');
 
@@ -20,6 +21,9 @@ const debounceTimers = new Map();
 const suppressUntil = new Map(); // ignore watcher events caused by our own saves
 const inFlight = new Set();
 const pendingRerun = new Set();
+const lastMtimes = new Map();
+let pollTimer;
+let pollInFlight = false;
 
 function log(message) {
   output.appendLine(`[${new Date().toISOString()}] ${message}`);
@@ -83,6 +87,14 @@ function ensureWatcher(doc) {
   watcher.onDidChange(onDiskEvent);
   watcher.onDidCreate(onDiskEvent); // atomic rename-replace writes surface as create
   watchers.set(key, watcher);
+  log(`${path.basename(doc.uri.fsPath)}: watching for disk changes`);
+  vscode.workspace.fs.stat(doc.uri).then(
+    (stat) => lastMtimes.set(key, stat.mtime),
+    () => {}
+  );
+  // The disk may already have diverged before this watcher existed (a buffer restored
+  // from backup, or a change that arrived while nothing was watching): check once now.
+  scheduleMerge(key);
 }
 
 function dropFileState(key) {
@@ -93,6 +105,37 @@ function dropFileState(key) {
   baseSnapshots.delete(key);
   suppressUntil.delete(key);
   pendingRerun.delete(key);
+  lastMtimes.delete(key);
+}
+
+// Fallback trigger: VS Code's workspace file watcher can die (e.g. a directory deleted
+// mid-scan kills the parcel watcher for the whole window) and it never restarts. When
+// that happens createFileSystemWatcher goes silent with it, so dirty watched buffers
+// are additionally polled by mtime. Content checks in handleDiskChange make a spurious
+// wake-up free, so false positives here are harmless.
+async function pollWatchedDocuments() {
+  if (pollInFlight || !config().enabled) return;
+  pollInFlight = true;
+  try {
+    for (const key of watchers.keys()) {
+      const doc = findOpenDocument(key);
+      if (!doc || !doc.isDirty) continue;
+      let mtime;
+      try {
+        mtime = (await vscode.workspace.fs.stat(doc.uri)).mtime;
+      } catch {
+        continue; // deleted on disk; nothing sane to merge against
+      }
+      const last = lastMtimes.get(key);
+      lastMtimes.set(key, mtime);
+      if (last === undefined || mtime === last) continue;
+      if (Date.now() < (suppressUntil.get(key) ?? 0)) continue;
+      log(`${path.basename(doc.uri.fsPath)}: disk mtime changed (poll fallback)`);
+      scheduleMerge(key);
+    }
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 function scheduleMerge(key) {
@@ -125,24 +168,29 @@ function retryLater(key, attempt, reason, basename) {
 async function handleDiskChange(key, attempt) {
   const doc = findOpenDocument(key);
   if (!doc) return dropFileState(key);
-  if (!doc.isDirty) return; // VS Code auto-reloads clean buffers itself
+  const basename = path.basename(doc.uri.fsPath);
+  if (!doc.isDirty) {
+    log(`${basename}: disk changed under a clean buffer; leaving the reload to VS Code`);
+    return;
+  }
 
   let theirs;
   try {
     theirs = await readDisk(doc.uri);
   } catch {
-    return; // file deleted on disk; nothing sane to merge against
+    log(`${basename}: unreadable or deleted on disk; skipping`);
+    return;
   }
   const ours = doc.getText();
   if (theirs === ours) {
+    log(`${basename}: buffer already matches disk; re-basing`);
     baseSnapshots.set(key, theirs);
     return;
   }
   const base = baseSnapshots.get(key) ?? '';
-  if (theirs === base) return; // mtime-only touch; buffer is just normally dirty
+  if (theirs === base) return; // mtime-only touch (or watch-start check); just dirty
 
   const cfg = config();
-  const basename = path.basename(doc.uri.fsPath);
   const tooBig = [base, ours, theirs].some((v) => v.length > cfg.maxFileBytes);
   if (tooBig) {
     log(`${basename}: exceeds maxFileBytes (${cfg.maxFileBytes}); skipping`);
@@ -182,6 +230,7 @@ async function performMerge({ doc, key, base, ours, theirs, cfg, basename, attem
     model: cfg.model,
     claudePath: cfg.claudePath,
     timeoutMs: cfg.timeoutMs,
+    log: (message) => log(`${basename}: ${message}`),
   });
 
   if (doc.isClosed) return;
@@ -251,30 +300,34 @@ async function mergeActiveFile() {
   await handleDiskChange(doc.uri.toString(), MAX_STALE_RETRIES - 1);
 }
 
-function snapshotExistingDocuments() {
-  for (const doc of vscode.workspace.textDocuments) {
-    if (!isMergeableDocument(doc)) continue;
-    const key = doc.uri.toString();
-    if (!doc.isDirty) {
-      baseSnapshots.set(key, doc.getText());
-    } else {
-      // Best effort for buffers already dirty at activation: current disk is the
-      // closest available ancestor.
-      readDisk(doc.uri)
-        .then((disk) => baseSnapshots.set(key, disk))
-        .catch(() => {});
-      ensureWatcher(doc);
-    }
+function trackDocument(doc) {
+  if (!isMergeableDocument(doc)) return;
+  const key = doc.uri.toString();
+  if (!doc.isDirty) {
+    baseSnapshots.set(key, doc.getText());
+    return;
   }
+  // Dirty before we ever saw a clean version (restored from backup, or already dirty
+  // at activation): the true ancestor is unknowable, so current disk is the closest
+  // available one. Never use the dirty buffer text as base — a later merge would then
+  // read the user's edits as "no change on our side" and resolve to plain disk.
+  readDisk(doc.uri)
+    .then((disk) => {
+      if (!baseSnapshots.has(key)) baseSnapshots.set(key, disk);
+      ensureWatcher(doc);
+    })
+    .catch(() => {});
 }
 
 function activate(context) {
-  snapshotExistingDocuments();
+  for (const doc of vscode.workspace.textDocuments) trackDocument(doc);
+  pollTimer = setInterval(() => {
+    pollWatchedDocuments().catch((err) => log(`poll: ${err.stack ?? err}`));
+  }, POLL_MS);
   context.subscriptions.push(
     output,
-    vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (isMergeableDocument(doc)) baseSnapshots.set(doc.uri.toString(), doc.getText());
-    }),
+    { dispose: () => clearInterval(pollTimer) },
+    vscode.workspace.onDidOpenTextDocument(trackDocument),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!isMergeableDocument(doc)) return;
       const key = doc.uri.toString();
@@ -294,10 +347,11 @@ function activate(context) {
     vscode.workspace.onDidCloseTextDocument((doc) => dropFileState(doc.uri.toString())),
     vscode.commands.registerCommand('llmSaveMerge.mergeActiveFile', mergeActiveFile)
   );
-  log('activated');
+  log('activated (watcher + watch-start check + mtime poll)');
 }
 
 function deactivate() {
+  clearInterval(pollTimer);
   for (const watcher of watchers.values()) watcher.dispose();
   watchers.clear();
 }
