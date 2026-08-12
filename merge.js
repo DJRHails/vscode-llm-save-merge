@@ -4,6 +4,11 @@
 const { spawn } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
+const Diff = require('diff');
+
+const DIFF_CONTEXT = 3; // context lines inside each unified-diff hunk
+const SPAN_PAD = 3; // unchanged base lines kept around the changed span, beyond hunk context
+const SPAN_MAX_RATIO = 0.8; // above this fraction of the file, excerpt mode buys nothing
 
 const SENTINEL_BASE = '-----8<----- LLM-SAVE-MERGE SECTION: BASE -----8<-----';
 const SENTINEL_OURS =
@@ -11,8 +16,14 @@ const SENTINEL_OURS =
 const SENTINEL_THEIRS =
   '-----8<----- LLM-SAVE-MERGE SECTION: THEIRS (file on disk) -----8<-----';
 const SENTINEL_END = '-----8<----- LLM-SAVE-MERGE SECTION: END -----8<-----';
+const SENTINEL_EXCERPT =
+  '-----8<----- LLM-SAVE-MERGE SECTION: ORIGINAL EXCERPT -----8<-----';
+const SENTINEL_DIFF_OURS =
+  '-----8<----- LLM-SAVE-MERGE SECTION: DIFF, ORIGINAL TO OURS (unsaved editor buffer) -----8<-----';
+const SENTINEL_DIFF_THEIRS =
+  '-----8<----- LLM-SAVE-MERGE SECTION: DIFF, ORIGINAL TO THEIRS (file on disk) -----8<-----';
 
-const INSTRUCTION = [
+const FULL_FILE_INSTRUCTION = [
   'Perform a three-way merge of a text file. The piped input contains three versions of',
   'the same file, delimited by sentinel lines: BASE (the common ancestor both sides',
   "started from), OURS (the user's unsaved editor buffer), and THEIRS (the file on disk,",
@@ -27,6 +38,129 @@ const INSTRUCTION = [
   'Do not use any tools. Output ONLY the complete merged file content: no code fences,',
   'no commentary, nothing before or after it.',
 ].join('\n');
+
+const EXCERPT_INSTRUCTION = [
+  'Perform a three-way merge on an excerpt of a text file. The piped input contains,',
+  'delimited by sentinel lines: ORIGINAL EXCERPT (a contiguous slice of the original',
+  'file that covers every change, plus a few unchanged context lines at each edge),',
+  "then two unified diffs against the same original file: one to OURS (the user's",
+  'unsaved editor buffer) and one to THEIRS (the file on disk, modified by another',
+  'process). Hunk headers refer to original-file line numbers; the excerpt header',
+  'states which original lines the excerpt spans.',
+  '',
+  'Apply BOTH diffs to the excerpt. Where the two sides changed the same region in',
+  'incompatible ways, prefer OURS, but never drop THEIRS-only additions or changes.',
+  "Lines neither diff touches — in particular the excerpt's leading and trailing",
+  'context lines — must be reproduced verbatim. Preserve formatting, whitespace, and',
+  'blank lines exactly as they appear in the inputs.',
+  '',
+  'Do not use any tools. Output ONLY the merged excerpt, the full replacement for the',
+  'ORIGINAL EXCERPT section: no code fences, no commentary, nothing before or after it.',
+].join('\n');
+
+function splitLines(text) {
+  const lines = text.split('\n');
+  const trailingNewline = text.endsWith('\n');
+  if (trailingNewline) lines.pop();
+  return { lines, trailingNewline };
+}
+
+function joinLines(lines, trailingNewline) {
+  return lines.join('\n') + (trailingNewline ? '\n' : '');
+}
+
+// Replace base lines start..end (1-indexed, inclusive) with the given segment.
+function spliceSegment(baseLines, start, end, segmentLines) {
+  return [...baseLines.slice(0, start - 1), ...segmentLines, ...baseLines.slice(end)];
+}
+
+// The base-line range touched by a patch, hunk context included. 1-indexed, inclusive.
+function changedSpan(hunks) {
+  let start = Infinity;
+  let end = -Infinity;
+  for (const hunk of hunks) {
+    start = Math.min(start, hunk.oldStart);
+    end = Math.max(end, hunk.oldStart + Math.max(hunk.oldLines, 1) - 1);
+  }
+  return { start, end };
+}
+
+// A side's lines corresponding to base lines start..end. Every hunk of the side's diff
+// lies inside the span, so lines before the span keep their indices and the segment
+// only stretches or shrinks at its far end, by the side's total line-count delta.
+function sideSegment(sideLines, start, end, baseCount) {
+  return sideLines.slice(start - 1, end + sideLines.length - baseCount);
+}
+
+// Everything needed to merge via excerpt + diffs, or null when excerpt mode does not
+// apply (unknown ancestor, or the changed span covers most of the file).
+function buildExcerptPlan({ base, ours, theirs, filePath }) {
+  if (!base) return null; // ancestor unknown; only the full-file prompt handles that
+  const baseSplit = splitLines(base);
+  const baseCount = baseSplit.lines.length;
+  const name = path.basename(filePath);
+  const oursPatch = Diff.structuredPatch(name, name, base, ours, 'original', 'ours', {
+    context: DIFF_CONTEXT,
+  });
+  const theirsPatch = Diff.structuredPatch(name, name, base, theirs, 'original', 'theirs', {
+    context: DIFF_CONTEXT,
+  });
+  if (!oursPatch.hunks.length || !theirsPatch.hunks.length) return null;
+
+  const oursSpan = changedSpan(oursPatch.hunks);
+  const theirsSpan = changedSpan(theirsPatch.hunks);
+  const hunksStart = Math.min(oursSpan.start, theirsSpan.start);
+  const hunksEnd = Math.max(oursSpan.end, theirsSpan.end);
+  const start = Math.max(1, hunksStart - SPAN_PAD);
+  const end = Math.min(baseCount, hunksEnd + SPAN_PAD);
+  if ((end - start + 1) / baseCount > SPAN_MAX_RATIO) return null;
+
+  const oursSplit = splitLines(ours);
+  const theirsSplit = splitLines(theirs);
+  const oursSegment = sideSegment(oursSplit.lines, start, end, baseCount);
+  const theirsSegment = sideSegment(theirsSplit.lines, start, end, baseCount);
+  // Runtime invariant: splicing a side's own segment back into base must reproduce
+  // that side byte-for-byte. If not, the span arithmetic is wrong for this input —
+  // fall back to the full-file prompt rather than risk a corrupting splice.
+  const oursRebuilt = joinLines(
+    spliceSegment(baseSplit.lines, start, end, oursSegment),
+    oursSplit.trailingNewline
+  );
+  const theirsRebuilt = joinLines(
+    spliceSegment(baseSplit.lines, start, end, theirsSegment),
+    theirsSplit.trailingNewline
+  );
+  if (oursRebuilt !== ours || theirsRebuilt !== theirs) return null;
+
+  return {
+    start,
+    end,
+    baseCount,
+    baseLines: baseSplit.lines,
+    baseTrailingNewline: baseSplit.trailingNewline,
+    baseSegment: baseSplit.lines.slice(start - 1, end),
+    oursSegment,
+    theirsSegment,
+    leadAnchor: hunksStart - start, // excerpt edge lines no hunk touches
+    trailAnchor: end - hunksEnd,
+    oursDiff: Diff.formatPatch(oursPatch),
+    theirsDiff: Diff.formatPatch(theirsPatch),
+  };
+}
+
+function buildExcerptPayload(plan, filePath) {
+  return [
+    `File path: ${filePath}`,
+    `Excerpt: lines ${plan.start}-${plan.end} of ${plan.baseCount} in the original file.`,
+    SENTINEL_EXCERPT,
+    plan.baseSegment.join('\n'),
+    SENTINEL_DIFF_OURS,
+    plan.oursDiff,
+    SENTINEL_DIFF_THEIRS,
+    plan.theirsDiff,
+    SENTINEL_END,
+  ].join('\n');
+}
 
 function buildPayload(base, ours, theirs, filePath) {
   return [
@@ -71,11 +205,29 @@ function validateMerged(merged, ours, theirs) {
   return null;
 }
 
-function runClaude({ claudePath, model, timeoutMs, payload }) {
+// The excerpt's edge lines are outside every hunk of both diffs, so no correct merge
+// may change them. A violated anchor means the model lost alignment.
+function validateExcerptAnchors(mergedLines, plan) {
+  for (let i = 0; i < plan.leadAnchor; i += 1) {
+    if (mergedLines[i] !== plan.baseSegment[i]) {
+      return `leading context line ${i + 1} not reproduced verbatim`;
+    }
+  }
+  for (let i = 0; i < plan.trailAnchor; i += 1) {
+    const merged = mergedLines[mergedLines.length - 1 - i];
+    const original = plan.baseSegment[plan.baseSegment.length - 1 - i];
+    if (merged !== original) {
+      return `trailing context line ${i + 1} (from the end) not reproduced verbatim`;
+    }
+  }
+  return null;
+}
+
+function runClaude({ claudePath, model, timeoutMs, instruction, payload }) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     env.PATH = `${path.join(os.homedir(), '.local', 'bin')}:${env.PATH ?? ''}`;
-    const args = ['--print', '--model', model, '--output-format', 'text', INSTRUCTION];
+    const args = ['--print', '--model', model, '--output-format', 'text', instruction];
     const child = spawn(claudePath, args, {
       cwd: os.tmpdir(),
       env,
@@ -111,9 +263,36 @@ function runClaude({ claudePath, model, timeoutMs, payload }) {
   });
 }
 
-async function llmMerge({ base, ours, theirs, filePath, model, claudePath, timeoutMs }) {
+async function mergeViaExcerpt(opts, plan) {
+  const raw = await runClaude({
+    claudePath: opts.claudePath,
+    model: opts.model,
+    timeoutMs: opts.timeoutMs,
+    instruction: EXCERPT_INSTRUCTION,
+    payload: buildExcerptPayload(plan, opts.filePath),
+  });
+  const mergedSegment = splitLines(stripWrappingFence(raw)).lines;
+  const problem =
+    validateMerged(
+      mergedSegment.join('\n'),
+      plan.oursSegment.join('\n'),
+      plan.theirsSegment.join('\n')
+    ) ?? validateExcerptAnchors(mergedSegment, plan);
+  if (problem) throw new Error(problem);
+  const fullLines = spliceSegment(plan.baseLines, plan.start, plan.end, mergedSegment);
+  const merged = joinLines(fullLines, plan.baseTrailingNewline);
+  return normalizeTrailingNewline(merged, opts.ours, opts.theirs);
+}
+
+async function mergeViaFullFile({ base, ours, theirs, filePath, model, claudePath, timeoutMs }) {
   const payload = buildPayload(base, ours, theirs, filePath);
-  const raw = await runClaude({ claudePath, model, timeoutMs, payload });
+  const raw = await runClaude({
+    claudePath,
+    model,
+    timeoutMs,
+    instruction: FULL_FILE_INSTRUCTION,
+    payload,
+  });
   const merged = normalizeTrailingNewline(stripWrappingFence(raw), ours, theirs);
   const problem = validateMerged(merged, ours, theirs);
   if (problem) {
@@ -122,4 +301,34 @@ async function llmMerge({ base, ours, theirs, filePath, model, claudePath, timeo
   return merged;
 }
 
-module.exports = { llmMerge, buildPayload, stripWrappingFence, normalizeTrailingNewline };
+async function llmMerge(opts) {
+  const { base, ours, theirs } = opts;
+  const log = opts.log ?? (() => {});
+  // One side unchanged relative to the ancestor: the other side IS the merge.
+  if (ours === base) return theirs;
+  if (theirs === base) return ours;
+
+  const plan = buildExcerptPlan(opts);
+  if (plan) {
+    const pct = Math.round(((plan.end - plan.start + 1) / plan.baseCount) * 100);
+    log(`excerpt merge: lines ${plan.start}-${plan.end} of ${plan.baseCount} (${pct}%)`);
+    try {
+      return await mergeViaExcerpt(opts, plan);
+    } catch (err) {
+      log(`excerpt merge failed (${err.message}); retrying with the full file`);
+    }
+  }
+  return mergeViaFullFile(opts);
+}
+
+module.exports = {
+  llmMerge,
+  buildPayload,
+  buildExcerptPlan,
+  buildExcerptPayload,
+  splitLines,
+  joinLines,
+  spliceSegment,
+  stripWrappingFence,
+  normalizeTrailingNewline,
+};

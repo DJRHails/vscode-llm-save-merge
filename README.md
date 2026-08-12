@@ -9,9 +9,22 @@ buffer, re-based on the new disk state. By the time you save, there is no confli
 
 ## Behaviour
 
-- **Trigger**: a watched file changes on disk while its buffer is dirty. Merges are
+- **Trigger**: a watched file changes on disk while its buffer is dirty. Three
+  detection paths back each other up: file-watcher events; a one-shot disk check when
+  a document is first watched (catches divergence from before watching began, e.g. a
+  dirty buffer restored from backup); and a 2-second mtime poll over watched dirty
+  buffers, because VS Code's workspace file watcher can die — a directory deleted
+  mid-scan kills it for the whole window — and it never restarts. Merges are
   debounced and re-checked for staleness (buffer or disk moving during the merge
   retries the merge, up to twice).
+- **Excerpt-scoped prompts**: the model receives the original-file excerpt covering
+  every change (plus a few context lines) and two unified diffs — original→buffer and
+  original→disk — and returns only the merged excerpt, which is spliced back into the
+  file mechanically. Before any model call, a runtime invariant checks the splice
+  arithmetic: each side's own segment spliced into the original must reproduce that
+  side byte-for-byte. Unknown ancestors, changes spanning most of the file, a failed
+  invariant, or a rejected excerpt (edge context lines must survive verbatim) fall
+  back to the original full three-version prompt.
 - **3-way, not 2-way**: the extension snapshots the disk content each buffer is based
   on (at open, save, and reload), so the model sees the common ancestor. Incompatible
   collisions prefer your buffer; disk-only changes are never dropped.
