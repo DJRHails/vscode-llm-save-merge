@@ -1,7 +1,7 @@
 // Launches a real VS Code (downloaded to .vscode-test/ on first run) with this
 // extension loaded, and runs test/e2e/suite.cjs inside its extension host. The claude
-// CLI is stubbed with a pre-baked merged excerpt, so the test is deterministic and
-// offline. Headless: xvfb-run -a node test/e2e/run.cjs
+// CLI is stubbed — replies are routed by the <file_path> in the payload, numbered per
+// doc — so the test is deterministic and offline. Headless: xvfb-run -a npm run test:e2e
 'use strict';
 
 const fs = require('node:fs');
@@ -11,35 +11,100 @@ const { runTests } = require('@vscode/test-electron');
 const { buildExcerptPlan } = require('../../merge.js');
 const scenario = require('./scenario.cjs');
 
-function bakeStub(stubDir, workspace) {
-  const plan = buildExcerptPlan({
-    base: scenario.baseText(),
-    ours: scenario.oursText(),
-    theirs: scenario.theirsText(),
-    filePath: path.join(workspace, 'doc.md'),
-  });
-  if (!plan) throw new Error('scenario unexpectedly has no excerpt plan');
-  const mergedSegment = plan.baseSegment.map((line) => {
-    if (line === 'line 15') return scenario.OURS_LINE;
-    if (line === 'line 25') return scenario.THEIRS_LINE;
+// The stub extracts docN from the payload's <file_path> and answers with the next
+// reply-docN-<i>.txt, capturing payload and args alongside for suite assertions.
+const STUB_SCRIPT = [
+  '#!/bin/sh',
+  'set -eu',
+  'payload=$(cat)',
+  'doc=$(printf \'%s\' "$payload" | sed -n \'s|.*<file_path>.*/\\(doc[0-9]*\\)\\.md</file_path>.*|\\1|p\' | head -1)',
+  'n=$(ls "$STUB_DIR" | grep -c "^call-$doc-" || true)',
+  'printf \'%s\' "$payload" > "$STUB_DIR/call-$doc-$n.txt"',
+  'printf \'%s\\n\' "$@" > "$STUB_DIR/args-$doc-$n.txt"',
+  'cat "$STUB_DIR/reply-$doc-$n.txt"',
+  '',
+].join('\n');
+
+function excerptReply({ base, ours, theirs, docPath }) {
+  const plan = buildExcerptPlan({ base, ours, theirs, filePath: docPath });
+  if (!plan) throw new Error(`scenario for ${docPath} unexpectedly has no excerpt plan`);
+  // These scenarios only replace whole lines (no inserts/deletes), so positions align
+  // across all three versions: take whichever side changed each segment line.
+  const oursLines = ours.split('\n');
+  const theirsLines = theirs.split('\n');
+  const mergedSegment = plan.baseSegment.map((line, i) => {
+    const at = plan.start - 1 + i;
+    if (oursLines[at] !== line) return oursLines[at];
+    if (theirsLines[at] !== line) return theirsLines[at];
     return line;
   });
-  fs.writeFileSync(path.join(stubDir, 'reply-0.txt'), `${mergedSegment.join('\n')}\n`);
+  return `${mergedSegment.join('\n')}\n`;
+}
 
-  const stubPath = path.join(stubDir, 'claude-stub.sh');
-  fs.writeFileSync(
-    stubPath,
-    [
-      '#!/bin/sh',
-      'set -eu',
-      'n=$(ls "$STUB_DIR" | grep -c "^call-" || true)',
-      'cat > "$STUB_DIR/call-$n.txt"',
-      'cat "$STUB_DIR/reply-$n.txt"',
-      '',
-    ].join('\n'),
-    { mode: 0o755 }
-  );
-  return stubPath;
+function bakeReplies(stubDir, workspace) {
+  const docPath = (doc) => path.join(workspace, `${doc}.md`);
+  const write = (name, content) => fs.writeFileSync(path.join(stubDir, name), content);
+
+  // excerpt-merge: one clean excerpt reply.
+  {
+    const sc = scenario.excerptMerge;
+    write(
+      `reply-${sc.doc}-0.txt`,
+      excerptReply({
+        base: sc.base,
+        ours: scenario.ours(sc),
+        theirs: scenario.theirs(sc),
+        docPath: docPath(sc.doc),
+      })
+    );
+  }
+
+  // full-file-fallback: first reply corrupts a leading anchor line, second reply is
+  // the valid full merged file.
+  {
+    const sc = scenario.fullFileFallback;
+    const good = excerptReply({
+      base: sc.base,
+      ours: scenario.ours(sc),
+      theirs: scenario.theirs(sc),
+      docPath: docPath(sc.doc),
+    });
+    const corrupted = ['CORRUPTED ANCHOR', ...good.split('\n').slice(1)].join('\n');
+    write(`reply-${sc.doc}-0.txt`, corrupted);
+    write(`reply-${sc.doc}-1.txt`, scenario.merged(sc));
+  }
+
+  // reload-then-merge: the merge happens against v2 (the auto-reloaded content). If
+  // the extension's base were still v1, its excerpt span would differ from this
+  // reply's span and validation would reject the merge — which is the point.
+  {
+    const sc = scenario.reloadThenMerge;
+    write(
+      `reply-${sc.doc}-0.txt`,
+      excerptReply({
+        base: sc.v2,
+        ours: scenario.ours(sc, sc.v2),
+        theirs: scenario.theirs(sc, sc.v2),
+        docPath: docPath(sc.doc),
+      })
+    );
+  }
+
+  // mtime-only-touch: no reply — any call is a failure the suite asserts on.
+
+  // manual-command: one clean excerpt reply, reached only via the palette command.
+  {
+    const sc = scenario.manualCommand;
+    write(
+      `reply-${sc.doc}-0.txt`,
+      excerptReply({
+        base: sc.base,
+        ours: scenario.ours(sc),
+        theirs: scenario.theirs(sc),
+        docPath: docPath(sc.doc),
+      })
+    );
+  }
 }
 
 async function main() {
@@ -52,16 +117,30 @@ async function main() {
   fs.mkdirSync(stubDir);
   fs.mkdirSync(home);
 
-  fs.writeFileSync(path.join(workspace, 'doc.md'), scenario.baseText());
-  const stubPath = bakeStub(stubDir, workspace);
+  for (const sc of [
+    scenario.excerptMerge,
+    scenario.fullFileFallback,
+    scenario.mtimeOnlyTouch,
+    scenario.manualCommand,
+  ]) {
+    fs.writeFileSync(path.join(workspace, `${sc.doc}.md`), sc.base);
+  }
+  fs.writeFileSync(
+    path.join(workspace, `${scenario.reloadThenMerge.doc}.md`),
+    scenario.reloadThenMerge.v1
+  );
+
+  bakeReplies(stubDir, workspace);
+  const stubPath = path.join(stubDir, 'claude-stub.sh');
+  fs.writeFileSync(stubPath, STUB_SCRIPT, { mode: 0o755 });
+
   fs.mkdirSync(path.join(workspace, '.vscode'));
   fs.writeFileSync(
     path.join(workspace, '.vscode', 'settings.json'),
     JSON.stringify({
       'llmSaveMerge.claudePath': stubPath,
       'llmSaveMerge.timeoutMs': 30000,
-      // Auto-save would save the dirty buffer mid-test; onDidSaveTextDocument then
-      // re-bases the extension on the buffer text and the scenario evaporates.
+      // Auto-save would save dirty buffers mid-test and dissolve the scenarios.
       'files.autoSave': 'off',
     })
   );
@@ -77,7 +156,7 @@ async function main() {
         HOME: home, // journals land under <home>/.local/state/llm-save-merge
       },
     });
-    console.log('e2e test passed');
+    console.log('e2e tests passed');
     fs.rmSync(root, { recursive: true, force: true });
   } catch (err) {
     console.error(`artifacts kept for debugging at ${root}`);
