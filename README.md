@@ -64,10 +64,13 @@ npm run test:live                 # live: real claude CLI, both prompt shapes
 xvfb-run -a npm run test:e2e      # e2e: real VS Code, stubbed CLI, conflict-free save
 ```
 
-The e2e run downloads a VS Code build to `.vscode-test/` on first use, opens a temp
-workspace, dirties a buffer, writes the file externally, and asserts the buffer was
-auto-merged (both edits present, disk untouched) and that the subsequent save raises
-no conflict.
+The e2e run downloads a VS Code build to `.vscode-test/` on first use and drives the
+real extension in a temp workspace (stub CLI, replies routed by `<file_path>`).
+Five scenarios, one instance: the basic dirty-buffer auto-merge ending in a
+conflict-free save; a corrupted excerpt reply falling back to the full-file prompt;
+a clean-buffer auto-reload followed by a merge that must use the reloaded base;
+an mtime-only touch that must stay quiet; and the palette command merging on demand
+with auto-merge disabled. On failure the suite prints every document event it saw.
 
 ## Build & install
 
