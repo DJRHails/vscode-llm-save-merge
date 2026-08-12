@@ -377,12 +377,29 @@ function activate(context) {
     vscode.workspace.onDidChangeTextDocument((event) => {
       const doc = event.document;
       if (!isMergeableDocument(doc)) return;
-      if (!doc.isDirty) {
-        // Covers auto-reload of clean buffers, undo-back-to-saved, and our own revert.
-        baseSnapshots.set(doc.uri.toString(), doc.getText());
+      if (doc.isDirty) {
+        ensureWatcher(doc);
         return;
       }
-      ensureWatcher(doc);
+      const key = doc.uri.toString();
+      const text = doc.getText();
+      if (event.contentChanges.length === 0) {
+        // An empty change on a clean document is a dirty-state flip (save, revert,
+        // undo back to saved): buffer equals disk, safe to re-base directly.
+        baseSnapshots.set(key, text);
+        return;
+      }
+      // A content change on a "clean" document is ambiguous: a real edit can arrive
+      // with isDirty still false — the dirty flip follows as a separate empty event
+      // (observed on VS Code 1.133) — and re-basing on it would poison base with the
+      // edited text, making a later merge resolve to plain disk and drop the edits.
+      // Trust the text only if disk confirms it (true for auto-reload of clean
+      // buffers, false for the mid-transition edit event).
+      readDisk(doc.uri)
+        .then((disk) => {
+          if (disk === text) baseSnapshots.set(key, text);
+        })
+        .catch(() => {});
     }),
     vscode.workspace.onDidCloseTextDocument((doc) => dropFileState(doc.uri.toString())),
     vscode.commands.registerCommand('llmSaveMerge.mergeActiveFile', mergeActiveFile)

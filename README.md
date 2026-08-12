@@ -56,6 +56,19 @@ authenticated on the machine where the extension host runs (the remote, for Remo
 The command palette entry **LLM Save Merge: Merge disk changes into active file** runs a
 merge on demand (works even with `enabled` off).
 
+## Tests
+
+```sh
+npm test                          # offline: span arithmetic, fallbacks, stubbed CLI
+npm run test:live                 # live: real claude CLI, both prompt shapes
+xvfb-run -a npm run test:e2e      # e2e: real VS Code, stubbed CLI, conflict-free save
+```
+
+The e2e run downloads a VS Code build to `.vscode-test/` on first use, opens a temp
+workspace, dirties a buffer, writes the file externally, and asserts the buffer was
+auto-merged (both edits present, disk untouched) and that the subsequent save raises
+no conflict.
+
 ## Build & install
 
 ```sh
