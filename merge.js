@@ -223,8 +223,17 @@ function validateExcerptAnchors(mergedLines, plan) {
   return null;
 }
 
-function runClaude({ claudePath, model, timeoutMs, instruction, payload }) {
+// `cancellation` is duck-typed to VS Code's CancellationToken so this module stays
+// free of the vscode import: { isCancellationRequested, onCancellationRequested }.
+function cancellationError() {
+  const err = new Error('merge cancelled by user');
+  err.cancelled = true;
+  return err;
+}
+
+function runClaude({ claudePath, model, timeoutMs, instruction, payload, cancellation }) {
   return new Promise((resolve, reject) => {
+    if (cancellation?.isCancellationRequested) return reject(cancellationError());
     const env = { ...process.env };
     env.PATH = `${path.join(os.homedir(), '.local', 'bin')}:${env.PATH ?? ''}`;
     const args = ['--print', '--model', model, '--output-format', 'text', instruction];
@@ -237,20 +246,31 @@ function runClaude({ claudePath, model, timeoutMs, instruction, payload }) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let cancelled = false;
+    const killChild = () => {
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 5000).unref();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChild();
     }, timeoutMs);
+    const cancelSub = cancellation?.onCancellationRequested?.(() => {
+      cancelled = true;
+      killChild();
+    });
 
     child.stdout.on('data', (chunk) => (stdout += chunk));
     child.stderr.on('data', (chunk) => (stderr += chunk));
     child.on('error', (err) => {
       clearTimeout(timer);
+      cancelSub?.dispose?.();
       reject(new Error(`failed to spawn ${claudePath}: ${err.message}`));
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      cancelSub?.dispose?.();
+      if (cancelled) return reject(cancellationError());
       if (timedOut) return reject(new Error(`claude timed out after ${timeoutMs}ms`));
       if (code !== 0) {
         return reject(new Error(`claude exited ${code}: ${stderr.slice(0, 400)}`));
@@ -270,6 +290,7 @@ async function mergeViaExcerpt(opts, plan) {
     timeoutMs: opts.timeoutMs,
     instruction: EXCERPT_INSTRUCTION,
     payload: buildExcerptPayload(plan, opts.filePath),
+    cancellation: opts.cancellation,
   });
   const mergedSegment = splitLines(stripWrappingFence(raw)).lines;
   const problem =
@@ -284,7 +305,8 @@ async function mergeViaExcerpt(opts, plan) {
   return normalizeTrailingNewline(merged, opts.ours, opts.theirs);
 }
 
-async function mergeViaFullFile({ base, ours, theirs, filePath, model, claudePath, timeoutMs }) {
+async function mergeViaFullFile(opts) {
+  const { base, ours, theirs, filePath, model, claudePath, timeoutMs, cancellation } = opts;
   const payload = buildPayload(base, ours, theirs, filePath);
   const raw = await runClaude({
     claudePath,
@@ -292,6 +314,7 @@ async function mergeViaFullFile({ base, ours, theirs, filePath, model, claudePat
     timeoutMs,
     instruction: FULL_FILE_INSTRUCTION,
     payload,
+    cancellation,
   });
   const merged = normalizeTrailingNewline(stripWrappingFence(raw), ours, theirs);
   const problem = validateMerged(merged, ours, theirs);
@@ -315,6 +338,7 @@ async function llmMerge(opts) {
     try {
       return await mergeViaExcerpt(opts, plan);
     } catch (err) {
+      if (err.cancelled) throw err; // a user cancel must not trigger a second model call
       log(`excerpt merge failed (${err.message}); retrying with the full file`);
     }
   }

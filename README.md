@@ -28,6 +28,9 @@ buffer, re-based on the new disk state. By the time you save, there is no confli
 - **3-way, not 2-way**: the extension snapshots the disk content each buffer is based
   on (at open, save, and reload), so the model sees the common ancestor. Incompatible
   collisions prefer your buffer; disk-only changes are never dropped.
+- **Progress you can see and stop**: a merge takes tens of seconds (model latency), so
+  it shows a notification with the merge phase and elapsed time, plus a Cancel button
+  that kills the model call and leaves the buffer untouched (fail-open, as ever).
 - **Disk is never written**: only the buffer is updated. The file on disk changes when
   you save, as usual.
 - **Every merge is journalled** to `~/.local/state/llm-save-merge/<timestamp>-<file>/`
@@ -47,7 +50,7 @@ authenticated on the machine where the extension host runs (the remote, for Remo
 | `llmSaveMerge.enabled` | `true` | auto-merge on disk divergence |
 | `llmSaveMerge.model` | `claude-sonnet-5` | model id for `claude --print --model` |
 | `llmSaveMerge.claudePath` | `claude` | claude binary (`~/.local/bin` is added to PATH) |
-| `llmSaveMerge.timeoutMs` | `120000` | merge call timeout |
+| `llmSaveMerge.timeoutMs` | `240000` | merge call timeout (full-file merges of large files are output-bound and slow) |
 | `llmSaveMerge.maxFileBytes` | `400000` | skip files larger than this |
 
 The command palette entry **LLM Save Merge: Merge disk changes into active file** runs a

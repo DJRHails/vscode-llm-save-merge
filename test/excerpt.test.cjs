@@ -204,6 +204,49 @@ async function stubbedAnchorFallback(stubRoot) {
   console.log('anchor-violation fallback passed');
 }
 
+function fakeCancellation() {
+  const listeners = [];
+  return {
+    isCancellationRequested: false,
+    onCancellationRequested(listener) {
+      listeners.push(listener);
+      return { dispose() {} };
+    },
+    cancel() {
+      this.isCancellationRequested = true;
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
+async function cancellationTest(stubRoot) {
+  const stubDir = fs.mkdtempSync(path.join(stubRoot, 'cancel-'));
+  process.env.STUB_DIR = stubDir;
+  const hangPath = path.join(stubDir, 'claude-hang.sh');
+  fs.writeFileSync(hangPath, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+
+  const base = numberedFile(40);
+  const cancellation = fakeCancellation();
+  setTimeout(() => cancellation.cancel(), 200);
+  const started = Date.now();
+  await assert.rejects(
+    llmMerge({
+      base,
+      ours: withEdit(base, 15, 'line 15 ours'),
+      theirs: withEdit(base, 25, 'line 25 theirs'),
+      filePath: '/tmp/doc.md',
+      model: 'stub',
+      claudePath: hangPath,
+      timeoutMs: 20000,
+      cancellation,
+    }),
+    (err) => err.cancelled === true && /cancelled/.test(err.message),
+    'cancel rejects with the cancelled marker'
+  );
+  assert.ok(Date.now() - started < 5000, 'cancel kills the child promptly, no fallback call');
+  console.log('cancellation test passed');
+}
+
 async function main() {
   planTests();
   await fastPathTests();
@@ -211,6 +254,7 @@ async function main() {
   try {
     await stubbedRoundTrip(stubRoot);
     await stubbedAnchorFallback(stubRoot);
+    await cancellationTest(stubRoot);
   } finally {
     fs.rmSync(stubRoot, { recursive: true, force: true });
   }

@@ -202,23 +202,58 @@ async function handleDiskChange(key, attempt) {
   }
 
   inFlight.add(key);
-  const status = vscode.window.setStatusBarMessage(`$(sync~spin) LLM-merging ${basename}…`);
   try {
-    await performMerge({ doc, key, base, ours, theirs, cfg, basename, attempt });
+    await mergeWithProgress({ doc, key, base, ours, theirs, cfg, basename, attempt });
   } catch (err) {
-    log(`${basename}: merge failed: ${err.stack ?? err}`);
-    vscode.window.showWarningMessage(
-      `LLM Save Merge failed for ${basename} (${err.message}). ` +
-        `VS Code's normal conflict dialog will apply on save.`
-    );
+    if (err.cancelled) {
+      log(`${basename}: merge cancelled by user`);
+    } else {
+      log(`${basename}: merge failed: ${err.stack ?? err}`);
+      vscode.window.showWarningMessage(
+        `LLM Save Merge failed for ${basename} (${err.message}). ` +
+          `VS Code's normal conflict dialog will apply on save.`
+      );
+    }
   } finally {
     inFlight.delete(key);
-    status.dispose();
     if (pendingRerun.delete(key)) scheduleMerge(key);
   }
 }
 
-async function performMerge({ doc, key, base, ours, theirs, cfg, basename, attempt }) {
+// A merge takes tens of seconds (model latency), so it gets a real notification with
+// elapsed time, the current phase, and a cancel button — not a status-bar whisper.
+function mergeWithProgress(job) {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `LLM-merging ${job.basename}`,
+      cancellable: true,
+    },
+    (progress, cancellation) => {
+      const startedAt = Date.now();
+      const phase = { label: 'merging' };
+      const timeoutSeconds = Math.round(job.cfg.timeoutMs / 1000);
+      const ticker = setInterval(() => {
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        progress.report({ message: `${phase.label} — ${elapsed}s (timeout ${timeoutSeconds}s)` });
+      }, 1000);
+      return performMerge({ ...job, cancellation, phase }).finally(() => clearInterval(ticker));
+    }
+  );
+}
+
+async function performMerge({
+  doc,
+  key,
+  base,
+  ours,
+  theirs,
+  cfg,
+  basename,
+  attempt,
+  cancellation,
+  phase,
+}) {
   const versionBefore = doc.version;
   log(`${basename}: merging (base ${base.length}B, ours ${ours.length}B, theirs ${theirs.length}B)`);
 
@@ -230,7 +265,12 @@ async function performMerge({ doc, key, base, ours, theirs, cfg, basename, attem
     model: cfg.model,
     claudePath: cfg.claudePath,
     timeoutMs: cfg.timeoutMs,
-    log: (message) => log(`${basename}: ${message}`),
+    cancellation,
+    log: (message) => {
+      log(`${basename}: ${message}`);
+      if (phase && message.startsWith('excerpt merge:')) phase.label = 'excerpt merge';
+      if (phase && message.startsWith('excerpt merge failed')) phase.label = 'full-file merge';
+    },
   });
 
   if (doc.isClosed) return;
