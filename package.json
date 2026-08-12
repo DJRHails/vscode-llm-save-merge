@@ -2,8 +2,13 @@
   "name": "llm-save-merge",
   "displayName": "LLM Save Merge",
   "description": "When a file changes on disk underneath an unsaved editor buffer, 3-way merge the two versions with an LLM instead of surfacing VS Code's save-conflict dialog.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "DJRHails",
+  "scripts": {
+    "test": "node test/excerpt.test.cjs",
+    "test:live": "node test/merge-live.test.cjs",
+    "test:e2e": "node test/e2e/run.cjs"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -59,5 +64,8 @@
   },
   "dependencies": {
     "diff": "9.0.0"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "3.1.0"
   }
 }
