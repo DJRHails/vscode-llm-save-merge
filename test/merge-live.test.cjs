@@ -62,7 +62,7 @@ async function liveTest() {
   assert.ok(merged.includes('Return a greeting'), 'kept OURS docstring');
   assert.ok(merged.includes('def farewell'), 'kept THEIRS new function');
   assert.ok(merged.includes('print(farewell("world"))'), 'kept THEIRS main change');
-  assert.ok(!merged.includes('LLM-SAVE-MERGE'), 'no sentinel leakage');
+  assert.ok(!/<\/?(base|ours|theirs|original_excerpt)>/.test(merged), 'no payload tag leakage');
   console.log('live full-file merge test passed');
 }
 

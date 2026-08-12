@@ -10,52 +10,56 @@ const DIFF_CONTEXT = 3; // context lines inside each unified-diff hunk
 const SPAN_PAD = 3; // unchanged base lines kept around the changed span, beyond hunk context
 const SPAN_MAX_RATIO = 0.8; // above this fraction of the file, excerpt mode buys nothing
 
-const SENTINEL_BASE = '-----8<----- LLM-SAVE-MERGE SECTION: BASE -----8<-----';
-const SENTINEL_OURS =
-  '-----8<----- LLM-SAVE-MERGE SECTION: OURS (unsaved editor buffer) -----8<-----';
-const SENTINEL_THEIRS =
-  '-----8<----- LLM-SAVE-MERGE SECTION: THEIRS (file on disk) -----8<-----';
-const SENTINEL_END = '-----8<----- LLM-SAVE-MERGE SECTION: END -----8<-----';
-const SENTINEL_EXCERPT =
-  '-----8<----- LLM-SAVE-MERGE SECTION: ORIGINAL EXCERPT -----8<-----';
-const SENTINEL_DIFF_OURS =
-  '-----8<----- LLM-SAVE-MERGE SECTION: DIFF, ORIGINAL TO OURS (unsaved editor buffer) -----8<-----';
-const SENTINEL_DIFF_THEIRS =
-  '-----8<----- LLM-SAVE-MERGE SECTION: DIFF, ORIGINAL TO THEIRS (file on disk) -----8<-----';
+// Every block the payload can carry, for leak detection in validateMerged.
+const PAYLOAD_TAGS = [
+  '<base>',
+  '</base>',
+  '<ours>',
+  '</ours>',
+  '<theirs>',
+  '</theirs>',
+  '<original_excerpt>',
+  '</original_excerpt>',
+  '<diff_original_to_ours>',
+  '</diff_original_to_ours>',
+  '<diff_original_to_theirs>',
+  '</diff_original_to_theirs>',
+];
 
 const FULL_FILE_INSTRUCTION = [
   'Perform a three-way merge of a text file. The piped input contains three versions of',
-  'the same file, delimited by sentinel lines: BASE (the common ancestor both sides',
-  "started from), OURS (the user's unsaved editor buffer), and THEIRS (the file on disk,",
-  'modified by another process).',
+  'the same file in XML tags: <base> (the common ancestor both sides started from),',
+  "<ours> (the user's unsaved editor buffer), and <theirs> (the file on disk, modified",
+  'by another process).',
   '',
-  'Apply BOTH sets of changes relative to BASE. Where the two sides changed the same',
-  'region in incompatible ways, prefer OURS, but never drop THEIRS-only additions or',
-  'changes elsewhere in the file. If BASE is empty because the ancestor is unknown,',
-  'produce the best faithful combination of OURS and THEIRS. Preserve formatting,',
-  'whitespace, and blank lines exactly as they appear in the inputs.',
+  'Apply BOTH sets of changes relative to <base>. Where the two sides changed the same',
+  'region in incompatible ways, prefer <ours>, but never drop <theirs>-only additions',
+  'or changes elsewhere in the file. If <base> is empty because the ancestor is',
+  'unknown, produce the best faithful combination of <ours> and <theirs>. Preserve',
+  'formatting, whitespace, and blank lines exactly as they appear in the inputs.',
   '',
-  'Do not use any tools. Output ONLY the complete merged file content: no code fences,',
-  'no commentary, nothing before or after it.',
+  'Do not use any tools. Output ONLY the complete merged file content: no XML tags, no',
+  'code fences, no commentary, nothing before or after it.',
 ].join('\n');
 
 const EXCERPT_INSTRUCTION = [
   'Perform a three-way merge on an excerpt of a text file. The piped input contains,',
-  'delimited by sentinel lines: ORIGINAL EXCERPT (a contiguous slice of the original',
-  'file that covers every change, plus a few unchanged context lines at each edge),',
-  "then two unified diffs against the same original file: one to OURS (the user's",
-  'unsaved editor buffer) and one to THEIRS (the file on disk, modified by another',
-  'process). Hunk headers refer to original-file line numbers; the excerpt header',
-  'states which original lines the excerpt spans.',
+  'in XML tags: <original_excerpt> (a contiguous slice of the original file that',
+  'covers every change, plus a few unchanged context lines at each edge), then two',
+  'unified diffs against the same original file: <diff_original_to_ours> (to the',
+  "user's unsaved editor buffer) and <diff_original_to_theirs> (to the file on disk,",
+  'modified by another process). Hunk headers refer to original-file line numbers;',
+  '<excerpt_range> states which original lines the excerpt spans.',
   '',
   'Apply BOTH diffs to the excerpt. Where the two sides changed the same region in',
-  'incompatible ways, prefer OURS, but never drop THEIRS-only additions or changes.',
+  'incompatible ways, prefer ours, but never drop theirs-only additions or changes.',
   "Lines neither diff touches — in particular the excerpt's leading and trailing",
   'context lines — must be reproduced verbatim. Preserve formatting, whitespace, and',
   'blank lines exactly as they appear in the inputs.',
   '',
   'Do not use any tools. Output ONLY the merged excerpt, the full replacement for the',
-  'ORIGINAL EXCERPT section: no code fences, no commentary, nothing before or after it.',
+  'content of <original_excerpt>: no XML tags, no code fences, no commentary, nothing',
+  'before or after it.',
 ].join('\n');
 
 function splitLines(text) {
@@ -148,30 +152,26 @@ function buildExcerptPlan({ base, ours, theirs, filePath }) {
   };
 }
 
+function xmlBlock(tag, content) {
+  return `<${tag}>\n${content}\n</${tag}>`;
+}
+
 function buildExcerptPayload(plan, filePath) {
   return [
-    `File path: ${filePath}`,
-    `Excerpt: lines ${plan.start}-${plan.end} of ${plan.baseCount} in the original file.`,
-    SENTINEL_EXCERPT,
-    plan.baseSegment.join('\n'),
-    SENTINEL_DIFF_OURS,
-    plan.oursDiff,
-    SENTINEL_DIFF_THEIRS,
-    plan.theirsDiff,
-    SENTINEL_END,
+    `<file_path>${filePath}</file_path>`,
+    `<excerpt_range>lines ${plan.start}-${plan.end} of ${plan.baseCount}</excerpt_range>`,
+    xmlBlock('original_excerpt', plan.baseSegment.join('\n')),
+    xmlBlock('diff_original_to_ours', plan.oursDiff),
+    xmlBlock('diff_original_to_theirs', plan.theirsDiff),
   ].join('\n');
 }
 
 function buildPayload(base, ours, theirs, filePath) {
   return [
-    `File path: ${filePath}`,
-    SENTINEL_BASE,
-    base,
-    SENTINEL_OURS,
-    ours,
-    SENTINEL_THEIRS,
-    theirs,
-    SENTINEL_END,
+    `<file_path>${filePath}</file_path>`,
+    xmlBlock('base', base),
+    xmlBlock('ours', ours),
+    xmlBlock('theirs', theirs),
   ].join('\n');
 }
 
@@ -196,7 +196,13 @@ function normalizeTrailingNewline(merged, ours, theirs) {
 
 function validateMerged(merged, ours, theirs) {
   if (merged.trim().length === 0) return 'model returned empty output';
-  if (merged.includes('LLM-SAVE-MERGE SECTION')) return 'sentinel lines leaked into output';
+  // A payload tag in the output that neither input carries means the model echoed
+  // prompt structure instead of file content (files legitimately containing these
+  // strings — this repo's own source, say — pass, because the inputs carry them too).
+  const leaked = PAYLOAD_TAGS.find(
+    (tag) => merged.includes(tag) && !ours.includes(tag) && !theirs.includes(tag)
+  );
+  if (leaked) return `payload tag ${leaked} leaked into output`;
   const hasConflictMarkers =
     /^(<{7}|={7}|>{7})/m.test(merged) && !/^(<{7}|={7}|>{7})/m.test(ours + theirs);
   if (hasConflictMarkers) return 'model emitted conflict markers';

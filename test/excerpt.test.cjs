@@ -164,10 +164,10 @@ async function stubbedRoundTrip(stubRoot) {
   assert.strictEqual(merged, expected, 'excerpt merge splices back to the full file');
 
   const payload = fs.readFileSync(path.join(stubDir, 'call-0.txt'), 'utf8');
-  assert.ok(payload.includes(`Excerpt: lines ${plan.start}-${plan.end} of 40`));
-  assert.ok(payload.includes('ORIGINAL EXCERPT'));
-  assert.ok(payload.includes('DIFF, ORIGINAL TO OURS'));
-  assert.ok(payload.includes('DIFF, ORIGINAL TO THEIRS'));
+  assert.ok(payload.includes(`<excerpt_range>lines ${plan.start}-${plan.end} of 40</excerpt_range>`));
+  assert.ok(payload.includes('<original_excerpt>'), 'excerpt wrapped in XML tags');
+  assert.ok(payload.includes('<diff_original_to_ours>'));
+  assert.ok(payload.includes('<diff_original_to_theirs>'));
   assert.ok(!payload.includes('line 5\nline 6'), 'payload does not carry the whole file');
   const args = fs.readFileSync(path.join(stubDir, 'args-0.txt'), 'utf8');
   assert.ok(args.includes('merge on an excerpt'), 'excerpt instruction used');
@@ -202,6 +202,34 @@ async function stubbedAnchorFallback(stubRoot) {
   const secondArgs = fs.readFileSync(path.join(stubDir, 'args-1.txt'), 'utf8');
   assert.ok(secondArgs.includes('three-way merge of a text file'), 'full-file instruction used');
   console.log('anchor-violation fallback passed');
+}
+
+async function stubbedTagLeakFallback(stubRoot) {
+  const stubDir = fs.mkdtempSync(path.join(stubRoot, 'tagleak-'));
+  process.env.STUB_DIR = stubDir;
+  const base = numberedFile(40);
+  const ours = withEdit(base, 15, 'line 15 ours');
+  const theirs = withEdit(base, 25, 'line 25 theirs');
+  const plan = buildExcerptPlan({ base, ours, theirs, filePath: '/tmp/doc.md' });
+  assert.ok(plan);
+
+  // First reply echoes payload structure: the leak check must reject it.
+  const leaky = ['<original_excerpt>', ...plan.baseSegment, '</original_excerpt>'].join('\n');
+  fs.writeFileSync(path.join(stubDir, 'reply-0.txt'), `${leaky}\n`);
+  const fullReply = withEdit(ours, 25, 'line 25 theirs');
+  fs.writeFileSync(path.join(stubDir, 'reply-1.txt'), fullReply);
+
+  const merged = await llmMerge({
+    base,
+    ours,
+    theirs,
+    filePath: '/tmp/doc.md',
+    model: 'stub',
+    claudePath: makeStub(stubDir),
+    timeoutMs: 10000,
+  });
+  assert.strictEqual(merged, fullReply, 'tag leak rejected, full-file fallback returned');
+  console.log('tag-leak fallback passed');
 }
 
 function fakeCancellation() {
@@ -254,6 +282,7 @@ async function main() {
   try {
     await stubbedRoundTrip(stubRoot);
     await stubbedAnchorFallback(stubRoot);
+    await stubbedTagLeakFallback(stubRoot);
     await cancellationTest(stubRoot);
   } finally {
     fs.rmSync(stubRoot, { recursive: true, force: true });
