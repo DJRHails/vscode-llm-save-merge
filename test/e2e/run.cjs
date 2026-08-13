@@ -21,6 +21,12 @@ const STUB_SCRIPT = [
   'n=$(ls "$STUB_DIR" | grep -c "^call-$doc-" || true)',
   'printf \'%s\' "$payload" > "$STUB_DIR/call-$doc-$n.txt"',
   'printf \'%s\\n\' "$@" > "$STUB_DIR/args-$doc-$n.txt"',
+  // A slow-<doc>-<n> marker makes that call hang (killable: the sleep runs detached
+  // in the background so SIGTERM to the shell releases the stdio pipes immediately).
+  'if [ -e "$STUB_DIR/slow-$doc-$n" ]; then',
+  '  sleep 20 </dev/null >/dev/null 2>&1 &',
+  '  wait $!',
+  'fi',
   'cat "$STUB_DIR/reply-$doc-$n.txt"',
   '',
 ].join('\n');
@@ -92,6 +98,28 @@ function bakeReplies(stubDir, workspace) {
 
   // mtime-only-touch: no reply — any call is a failure the suite asserts on.
 
+  // cancel-on-edit: the first call hangs (slow marker) and gets killed by the
+  // mid-call buffer edit; the second call merges the fresh buffer against disk.
+  {
+    const sc = scenario.cancelOnEdit;
+    fs.writeFileSync(path.join(stubDir, `slow-${sc.doc}-0`), '');
+    write(`reply-${sc.doc}-0.txt`, 'unused: this call is expected to be killed\n');
+    const oursTwice = scenario.replaceLine(
+      scenario.ours(sc),
+      sc.secondEdit[0],
+      sc.secondEdit[1]
+    );
+    write(
+      `reply-${sc.doc}-1.txt`,
+      excerptReply({
+        base: sc.base,
+        ours: oursTwice,
+        theirs: scenario.theirs(sc),
+        docPath: docPath(sc.doc),
+      })
+    );
+  }
+
   // manual-command: one clean excerpt reply, reached only via the palette command.
   {
     const sc = scenario.manualCommand;
@@ -122,6 +150,7 @@ async function main() {
     scenario.fullFileFallback,
     scenario.mtimeOnlyTouch,
     scenario.manualCommand,
+    scenario.cancelOnEdit,
   ]) {
     fs.writeFileSync(path.join(workspace, `${sc.doc}.md`), sc.base);
   }

@@ -64,6 +64,17 @@ const manualCommand = {
   theirsLine: [25, 'doc5 line 25, rewritten on disk by another process'],
 };
 
+// cancel-on-edit (doc6): a buffer edit while the model call is in flight must kill the
+// call immediately and re-merge with the fresh buffer text. The stub's first call
+// sleeps far longer than the assertion deadline, so only a genuine kill can pass.
+const cancelOnEdit = {
+  doc: 'doc6',
+  base: numberedFile('doc6', 40),
+  oursLine: [15, 'doc6 line 15, edited in the buffer and unsaved'],
+  secondEdit: [5, 'doc6 line 5, edited again while the merge was in flight'],
+  theirsLine: [25, 'doc6 line 25, rewritten on disk by another process'],
+};
+
 function ours(sc, base) {
   return replaceLine(base ?? sc.base, sc.oursLine[0], sc.oursLine[1]);
 }
@@ -84,6 +95,7 @@ module.exports = {
   reloadThenMerge,
   mtimeOnlyTouch,
   manualCommand,
+  cancelOnEdit,
   ours,
   theirs,
   merged,

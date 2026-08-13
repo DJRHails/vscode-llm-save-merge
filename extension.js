@@ -19,7 +19,9 @@ const baseSnapshots = new Map(); // disk content the buffer is currently based o
 const watchers = new Map();
 const debounceTimers = new Map();
 const suppressUntil = new Map(); // ignore watcher events caused by our own saves
-const inFlight = new Set();
+// key -> in-flight merge context: { versionBefore, theirs, cancelStale, staleWhy }.
+// cancelStale kills the model call when the inputs it was given stop being current.
+const inFlight = new Map();
 const pendingRerun = new Set();
 const lastMtimes = new Map();
 // Bases seeded from current disk for buffers that were ALREADY dirty when first seen
@@ -220,16 +222,38 @@ async function handleDiskChange(key, attempt, manual = false) {
     log(`${basename}: exceeds maxFileBytes (${cfg.maxFileBytes}); skipping`);
     return;
   }
-  if (inFlight.has(key)) {
+  const alreadyRunning = inFlight.get(key);
+  if (alreadyRunning) {
     pendingRerun.add(key);
+    if (theirs !== alreadyRunning.theirs) {
+      // Disk moved past the inputs the running merge was given: its result is
+      // pre-doomed, so kill the model call now instead of after the timeout.
+      alreadyRunning.cancelStale?.('disk changed during the model call');
+    }
     return;
   }
 
-  inFlight.add(key);
+  const running = { versionBefore: doc.version, theirs, cancelStale: null, staleWhy: null };
+  inFlight.set(key, running);
   try {
-    await mergeWithProgress({ doc, key, base, ours, theirs, cfg, basename, attempt, manual });
+    await mergeWithProgress({
+      doc,
+      key,
+      base,
+      ours,
+      theirs,
+      cfg,
+      basename,
+      attempt,
+      manual,
+      running,
+    });
   } catch (err) {
-    if (err.cancelled) {
+    if (err.cancelled && running.staleWhy) {
+      // Cancelled by us, not the user: the reschedule is already queued (the
+      // canceller sets pendingRerun, drained by the finally below).
+      log(`${basename}: merge call killed (${running.staleWhy}); rescheduling`);
+    } else if (err.cancelled) {
       log(`${basename}: merge cancelled by user`);
     } else if (err.stale) {
       retryLater(key, attempt, 'inputs went stale during the merge', basename, manual);
@@ -246,6 +270,30 @@ async function handleDiskChange(key, attempt, manual = false) {
   }
 }
 
+// The UI token fires on the notification's Cancel button; the composed token also lets
+// the staleness cancellers kill the model call when the inputs stop being current.
+function composeCancellation(uiToken) {
+  const listeners = new Set();
+  let requested = false;
+  const request = () => {
+    if (requested) return;
+    requested = true;
+    for (const listener of [...listeners]) listener();
+  };
+  const relay = uiToken.onCancellationRequested(request);
+  return {
+    get isCancellationRequested() {
+      return requested || uiToken.isCancellationRequested;
+    },
+    onCancellationRequested(listener) {
+      listeners.add(listener);
+      return { dispose: () => listeners.delete(listener) };
+    },
+    request,
+    dispose: () => relay.dispose(),
+  };
+}
+
 // A merge takes tens of seconds (model latency), so it gets a real notification with
 // elapsed time, the current phase, and a cancel button — not a status-bar whisper.
 function mergeWithProgress(job) {
@@ -255,15 +303,24 @@ function mergeWithProgress(job) {
       title: `LLM-merging ${job.basename}`,
       cancellable: true,
     },
-    (progress, cancellation) => {
+    (progress, uiToken) => {
       const startedAt = Date.now();
       const phase = { label: 'merging' };
       const timeoutSeconds = Math.round(job.cfg.timeoutMs / 1000);
+      const cancellation = composeCancellation(uiToken);
+      job.running.cancelStale = (why) => {
+        if (job.running.staleWhy) return;
+        job.running.staleWhy = why;
+        cancellation.request();
+      };
       const ticker = setInterval(() => {
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
         progress.report({ message: `${phase.label} — ${elapsed}s (timeout ${timeoutSeconds}s)` });
       }, 1000);
-      return performMerge({ ...job, cancellation, phase }).finally(() => clearInterval(ticker));
+      return performMerge({ ...job, cancellation, phase }).finally(() => {
+        clearInterval(ticker);
+        cancellation.dispose();
+      });
     }
   );
 }
@@ -278,6 +335,7 @@ async function performMerge({
   basename,
   attempt,
   manual,
+  running,
   cancellation,
   phase,
 }) {
@@ -307,6 +365,11 @@ async function performMerge({
       if (phase && message.startsWith('excerpt merge failed')) phase.label = 'full-file merge';
     },
   });
+
+  // The model call is done: disarm the staleness canceller so our own revert and
+  // replace below (which fire change events) cannot kill their own merge. Staleness
+  // from here on is handled by the version and disk checks.
+  if (running) running.cancelStale = null;
 
   if (doc.isClosed) return;
   if (doc.version !== versionBefore) {
@@ -418,11 +481,22 @@ function activate(context) {
     vscode.workspace.onDidChangeTextDocument((event) => {
       const doc = event.document;
       if (!isMergeableDocument(doc)) return;
+      const key = doc.uri.toString();
+      const running = inFlight.get(key);
+      if (
+        running?.cancelStale &&
+        event.contentChanges.length > 0 &&
+        doc.version !== running.versionBefore
+      ) {
+        // The buffer moved while a merge was mid-call: the result would fail the
+        // version check anyway, so kill the call now and re-merge with fresh text.
+        pendingRerun.add(key);
+        running.cancelStale('buffer changed during the model call');
+      }
       if (doc.isDirty) {
         ensureWatcher(doc);
         return;
       }
-      const key = doc.uri.toString();
       const text = doc.getText();
       if (event.contentChanges.length === 0) {
         // An empty change on a clean document is a dirty-state flip (save, revert,

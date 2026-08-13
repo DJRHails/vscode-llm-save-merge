@@ -167,6 +167,36 @@ async function manualCommand(workspace) {
   }
 }
 
+// A buffer edit while the model call is in flight must kill the call immediately and
+// re-merge with the fresh text. The stub's first call sleeps 20s while the assertion
+// deadline is 15s, so waiting out the sleep (no kill) cannot pass.
+async function cancelOnEdit(workspace) {
+  const sc = scenario.cancelOnEdit;
+  const { document, filePath } = await openAndEdit(workspace, sc.doc, sc.oursLine);
+  fs.writeFileSync(filePath, scenario.theirs(sc));
+  await sleep(2500); // debounce passed; the first model call is now hanging in the stub
+  assert.strictEqual(stubCalls(sc.doc).length, 1, 'first call in flight');
+
+  const editor = await vscode.window.showTextDocument(document);
+  const target = document.lineAt(sc.secondEdit[0] - 1);
+  const applied = await editor.edit((edit) => edit.replace(target.range, sc.secondEdit[1]));
+  assert.ok(applied, 'mid-call edit applied');
+
+  const expected = scenario.replaceLine(
+    scenario.merged(sc),
+    sc.secondEdit[0],
+    sc.secondEdit[1]
+  );
+  await waitFor(() => document.getText() === expected, 15000, 'kill + re-merge with fresh text');
+  assert.strictEqual(stubCalls(sc.doc).length, 2, 'killed call plus fresh call');
+  const secondPayload = fs.readFileSync(
+    path.join(process.env.STUB_DIR, `call-${sc.doc}-1.txt`),
+    'utf8'
+  );
+  assert.ok(secondPayload.includes(sc.secondEdit[1]), 'fresh call carries the mid-call edit');
+  console.log('scenario cancel-on-edit passed');
+}
+
 async function run() {
   const workspace = process.env.LSM_E2E_WORKSPACE;
   assert.ok(workspace, 'LSM_E2E_WORKSPACE is set');
@@ -176,6 +206,7 @@ async function run() {
     await fullFileFallback(workspace);
     await reloadThenMerge(workspace);
     await mtimeOnlyTouch(workspace);
+    await cancelOnEdit(workspace);
     await manualCommand(workspace);
   } catch (err) {
     console.error(`document events seen:\n${events.join('\n')}`);

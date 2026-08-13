@@ -31,6 +31,9 @@ buffer, re-based on the new disk state. By the time you save, there is no confli
 - **Progress you can see and stop**: a merge takes tens of seconds (model latency), so
   it shows a notification with the merge phase and elapsed time, plus a Cancel button
   that kills the model call and leaves the buffer untouched (fail-open, as ever).
+- **Stale calls die immediately**: if the buffer is edited or the disk changes again
+  while a model call is in flight, the call is killed on the spot — its result could
+  only be discarded — and the merge reschedules with fresh inputs.
 - **Disk is never written**: only the buffer is updated. The file on disk changes when
   you save, as usual.
 - **Every merge is journalled** to `~/.local/state/llm-save-merge/<timestamp>-<file>/`
