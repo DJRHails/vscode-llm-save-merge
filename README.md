@@ -54,7 +54,10 @@ authenticated on the machine where the extension host runs (the remote, for Remo
 | `llmSaveMerge.maxFileBytes` | `400000` | skip files larger than this |
 
 The command palette entry **LLM Save Merge: Merge disk changes into active file** runs a
-merge on demand (works even with `enabled` off).
+merge on demand (works even with `enabled` off). For a buffer that was restored dirty
+from backup — where the true ancestor is unknowable and disk divergence from before the
+restore is invisible to the automatic triggers — the manual command merges anyway,
+ancestor-less: the model combines buffer and disk faithfully.
 
 ## Tests
 

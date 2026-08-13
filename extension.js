@@ -22,6 +22,9 @@ const suppressUntil = new Map(); // ignore watcher events caused by our own save
 const inFlight = new Set();
 const pendingRerun = new Set();
 const lastMtimes = new Map();
+// Bases seeded from current disk for buffers that were ALREADY dirty when first seen
+// (restored from backup): the true ancestor is unknowable, so these are guesses.
+const provisionalBases = new Set();
 let pollTimer;
 let pollInFlight = false;
 
@@ -97,6 +100,12 @@ function ensureWatcher(doc) {
   scheduleMerge(key);
 }
 
+// Record an authoritative base: buffer text known to match a real disk state.
+function settleBase(key, text) {
+  baseSnapshots.set(key, text);
+  provisionalBases.delete(key);
+}
+
 function dropFileState(key) {
   watchers.get(key)?.dispose();
   watchers.delete(key);
@@ -106,6 +115,7 @@ function dropFileState(key) {
   suppressUntil.delete(key);
   pendingRerun.delete(key);
   lastMtimes.delete(key);
+  provisionalBases.delete(key);
 }
 
 // Fallback trigger: VS Code's workspace file watcher can die (e.g. a directory deleted
@@ -150,7 +160,7 @@ function scheduleMerge(key) {
   );
 }
 
-function retryLater(key, attempt, reason, basename) {
+function retryLater(key, attempt, reason, basename, manual) {
   if (attempt >= MAX_STALE_RETRIES) {
     log(`${basename}: gave up after ${attempt} retries (${reason})`);
     vscode.window.showWarningMessage(
@@ -161,11 +171,13 @@ function retryLater(key, attempt, reason, basename) {
   }
   log(`${basename}: ${reason}; retrying (attempt ${attempt + 1})`);
   setTimeout(() => {
-    handleDiskChange(key, attempt + 1).catch((err) => log(`unhandled: ${err.stack ?? err}`));
+    handleDiskChange(key, attempt + 1, manual).catch(
+      (err) => log(`unhandled: ${err.stack ?? err}`)
+    );
   }, DEBOUNCE_MS);
 }
 
-async function handleDiskChange(key, attempt) {
+async function handleDiskChange(key, attempt, manual = false) {
   const doc = findOpenDocument(key);
   if (!doc) return dropFileState(key);
   const basename = path.basename(doc.uri.fsPath);
@@ -184,11 +196,23 @@ async function handleDiskChange(key, attempt) {
   const ours = doc.getText();
   if (theirs === ours) {
     log(`${basename}: buffer already matches disk; re-basing`);
-    baseSnapshots.set(key, theirs);
+    settleBase(key, theirs);
     return;
   }
-  const base = baseSnapshots.get(key) ?? '';
-  if (theirs === base) return; // mtime-only touch (or watch-start check); just dirty
+  let base = baseSnapshots.get(key) ?? '';
+  if (theirs === base) {
+    if (!manual || !provisionalBases.has(key)) {
+      // Mtime-only touch, or the watch-start check on an unchanged disk.
+      log(`${basename}: disk matches the base snapshot; buffer is just dirty`);
+      return;
+    }
+    // A restored-dirty buffer: base was seeded from current disk, so the true
+    // ancestor is unknown — divergence from before the restore is invisible here.
+    // The user explicitly asked to merge, so run ancestor-less: the full-file
+    // prompt combines buffer and disk faithfully when base is empty.
+    log(`${basename}: manual merge with unknown ancestor; combining buffer and disk`);
+    base = '';
+  }
 
   const cfg = config();
   const tooBig = [base, ours, theirs].some((v) => v.length > cfg.maxFileBytes);
@@ -203,7 +227,7 @@ async function handleDiskChange(key, attempt) {
 
   inFlight.add(key);
   try {
-    await mergeWithProgress({ doc, key, base, ours, theirs, cfg, basename, attempt });
+    await mergeWithProgress({ doc, key, base, ours, theirs, cfg, basename, attempt, manual });
   } catch (err) {
     if (err.cancelled) {
       log(`${basename}: merge cancelled by user`);
@@ -251,6 +275,7 @@ async function performMerge({
   cfg,
   basename,
   attempt,
+  manual,
   cancellation,
   phase,
 }) {
@@ -275,10 +300,10 @@ async function performMerge({
 
   if (doc.isClosed) return;
   if (doc.version !== versionBefore) {
-    return retryLater(key, attempt, 'buffer changed during merge', basename);
+    return retryLater(key, attempt, 'buffer changed during merge', basename, manual);
   }
   if ((await readDisk(doc.uri)) !== theirs) {
-    return retryLater(key, attempt, 'disk changed again during merge', basename);
+    return retryLater(key, attempt, 'disk changed again during merge', basename, manual);
   }
 
   const journalled = journal(doc.uri.fsPath, { base, ours, theirs, merged });
@@ -301,7 +326,7 @@ async function rebaseBufferOnDisk(doc, key, theirs, ours) {
     await vscode.window.showTextDocument(doc, { preview: false });
     await vscode.commands.executeCommand('workbench.action.files.revert');
   }
-  baseSnapshots.set(key, theirs);
+  settleBase(key, theirs);
 }
 
 async function replaceAll(doc, text) {
@@ -332,19 +357,22 @@ function notifyMerged(doc, basename, journalled) {
 async function mergeActiveFile() {
   const doc = vscode.window.activeTextEditor?.document;
   if (!doc || !isMergeableDocument(doc)) {
+    log('manual merge requested: no mergeable file active');
     return vscode.window.showInformationMessage('LLM Save Merge: no mergeable file active.');
   }
   if (!doc.isDirty) {
+    log(`manual merge requested: ${path.basename(doc.uri.fsPath)} is clean`);
     return vscode.window.showInformationMessage('LLM Save Merge: buffer is clean.');
   }
-  await handleDiskChange(doc.uri.toString(), MAX_STALE_RETRIES - 1);
+  log(`${path.basename(doc.uri.fsPath)}: manual merge requested`);
+  await handleDiskChange(doc.uri.toString(), MAX_STALE_RETRIES - 1, true);
 }
 
 function trackDocument(doc) {
   if (!isMergeableDocument(doc)) return;
   const key = doc.uri.toString();
   if (!doc.isDirty) {
-    baseSnapshots.set(key, doc.getText());
+    settleBase(key, doc.getText());
     return;
   }
   // Dirty before we ever saw a clean version (restored from backup, or already dirty
@@ -353,7 +381,10 @@ function trackDocument(doc) {
   // read the user's edits as "no change on our side" and resolve to plain disk.
   readDisk(doc.uri)
     .then((disk) => {
-      if (!baseSnapshots.has(key)) baseSnapshots.set(key, disk);
+      if (!baseSnapshots.has(key)) {
+        baseSnapshots.set(key, disk);
+        provisionalBases.add(key);
+      }
       ensureWatcher(doc);
     })
     .catch(() => {});
@@ -371,7 +402,7 @@ function activate(context) {
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!isMergeableDocument(doc)) return;
       const key = doc.uri.toString();
-      baseSnapshots.set(key, doc.getText());
+      settleBase(key, doc.getText());
       suppressUntil.set(key, Date.now() + SELF_SAVE_SUPPRESS_MS);
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
@@ -386,7 +417,7 @@ function activate(context) {
       if (event.contentChanges.length === 0) {
         // An empty change on a clean document is a dirty-state flip (save, revert,
         // undo back to saved): buffer equals disk, safe to re-base directly.
-        baseSnapshots.set(key, text);
+        settleBase(key, text);
         return;
       }
       // A content change on a "clean" document is ambiguous: a real edit can arrive
@@ -397,7 +428,7 @@ function activate(context) {
       // buffers, false for the mid-transition edit event).
       readDisk(doc.uri)
         .then((disk) => {
-          if (disk === text) baseSnapshots.set(key, text);
+          if (disk === text) settleBase(key, text);
         })
         .catch(() => {});
     }),
