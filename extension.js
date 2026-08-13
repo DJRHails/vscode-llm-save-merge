@@ -231,6 +231,8 @@ async function handleDiskChange(key, attempt, manual = false) {
   } catch (err) {
     if (err.cancelled) {
       log(`${basename}: merge cancelled by user`);
+    } else if (err.stale) {
+      retryLater(key, attempt, 'inputs went stale during the merge', basename, manual);
     } else {
       log(`${basename}: merge failed: ${err.stack ?? err}`);
       vscode.window.showWarningMessage(
@@ -291,6 +293,14 @@ async function performMerge({
     claudePath: cfg.claudePath,
     timeoutMs: cfg.timeoutMs,
     cancellation,
+    isStale: async () => {
+      if (doc.isClosed || doc.version !== versionBefore) return true;
+      try {
+        return (await readDisk(doc.uri)) !== theirs;
+      } catch {
+        return true;
+      }
+    },
     log: (message) => {
       log(`${basename}: ${message}`);
       if (phase && message.startsWith('excerpt merge:')) phase.label = 'excerpt merge';
