@@ -330,6 +330,12 @@ async function mergeViaFullFile(opts) {
   return merged;
 }
 
+function staleError() {
+  const err = new Error('inputs went stale during the merge');
+  err.stale = true;
+  return err;
+}
+
 async function llmMerge(opts) {
   const { base, ours, theirs } = opts;
   const log = opts.log ?? (() => {});
@@ -345,6 +351,13 @@ async function llmMerge(opts) {
       return await mergeViaExcerpt(opts, plan);
     } catch (err) {
       if (err.cancelled) throw err; // a user cancel must not trigger a second model call
+      // A slow excerpt call (minutes under API degradation) leaves time for the
+      // buffer or disk to move on; a full-file call on stale inputs is pre-doomed
+      // and would burn the whole timeout again. Bail out to the caller's retry.
+      if (opts.isStale && (await opts.isStale())) {
+        log(`excerpt merge failed (${err.message}); inputs stale, skipping the full-file retry`);
+        throw staleError();
+      }
       log(`excerpt merge failed (${err.message}); retrying with the full file`);
     }
   }

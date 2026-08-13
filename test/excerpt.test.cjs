@@ -232,6 +232,38 @@ async function stubbedTagLeakFallback(stubRoot) {
   console.log('tag-leak fallback passed');
 }
 
+async function stubbedStaleAbort(stubRoot) {
+  const stubDir = fs.mkdtempSync(path.join(stubRoot, 'stale-'));
+  process.env.STUB_DIR = stubDir;
+  const base = numberedFile(40);
+  const ours = withEdit(base, 15, 'line 15 ours');
+  const theirs = withEdit(base, 25, 'line 25 theirs');
+  const plan = buildExcerptPlan({ base, ours, theirs, filePath: '/tmp/doc.md' });
+  assert.ok(plan);
+  // The excerpt reply is rejected (broken anchor); with stale inputs the full-file
+  // retry must be skipped and the stale marker surfaced instead.
+  const corrupted = ['CORRUPTED', ...plan.baseSegment.slice(1)].join('\n');
+  fs.writeFileSync(path.join(stubDir, 'reply-0.txt'), `${corrupted}\n`);
+
+  await assert.rejects(
+    llmMerge({
+      base,
+      ours,
+      theirs,
+      filePath: '/tmp/doc.md',
+      model: 'stub',
+      claudePath: makeStub(stubDir),
+      timeoutMs: 10000,
+      isStale: async () => true,
+    }),
+    (err) => err.stale === true,
+    'stale inputs abort with the stale marker'
+  );
+  const calls = fs.readdirSync(stubDir).filter((f) => f.startsWith('call-'));
+  assert.strictEqual(calls.length, 1, 'no second model call on stale inputs');
+  console.log('stale-abort test passed');
+}
+
 function fakeCancellation() {
   const listeners = [];
   return {
@@ -283,6 +315,7 @@ async function main() {
     await stubbedRoundTrip(stubRoot);
     await stubbedAnchorFallback(stubRoot);
     await stubbedTagLeakFallback(stubRoot);
+    await stubbedStaleAbort(stubRoot);
     await cancellationTest(stubRoot);
   } finally {
     fs.rmSync(stubRoot, { recursive: true, force: true });
