@@ -79,10 +79,19 @@ function ours(sc, base) {
   return replaceLine(base ?? sc.base, sc.oursLine[0], sc.oursLine[1]);
 }
 
-function theirs(sc, base) {
-  return replaceLine(base ?? sc.base, sc.theirsLine[0], sc.theirsLine[1]);
+// Every merging scenario is a genuine dispute — disk rewrites the same line the buffer
+// edited — plus a disk-only rewrite at `theirsLine` that the mechanical stage settles
+// without the model. Disjoint edits would never reach the stub.
+function theirsDisputed(sc) {
+  return `${sc.doc} line ${sc.oursLine[0]}, rewritten on disk under the buffer's edit`;
 }
 
+function theirs(sc, base) {
+  const disputed = replaceLine(base ?? sc.base, sc.oursLine[0], theirsDisputed(sc));
+  return replaceLine(disputed, sc.theirsLine[0], sc.theirsLine[1]);
+}
+
+// The buffer wins the dispute; the disk-only rewrite lands.
 function merged(sc, base) {
   return replaceLine(ours(sc, base), sc.theirsLine[0], sc.theirsLine[1]);
 }

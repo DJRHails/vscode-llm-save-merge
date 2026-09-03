@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { runTests } = require('@vscode/test-electron');
-const { buildExcerptPlan } = require('../../merge.js');
+const { buildExcerptPlan, mechanicalMerge } = require('../../merge.js');
 const scenario = require('./scenario.cjs');
 
 // The stub extracts docN from the payload's <file_path> and answers with the next
@@ -32,12 +32,18 @@ const STUB_SCRIPT = [
 ].join('\n');
 
 function excerptReply({ base, ours, theirs, docPath }) {
-  const plan = buildExcerptPlan({ base, ours, theirs, filePath: docPath });
+  // The model sees the three versions after the mechanical stage has settled every
+  // undisputed hunk, so the plan — and this reply — must be computed on those.
+  const staged = mechanicalMerge({ base, ours, theirs });
+  if (!staged || staged.disputed === 0) {
+    throw new Error(`scenario for ${docPath} leaves nothing disputed; the stub would never run`);
+  }
+  const plan = buildExcerptPlan({ ...staged, filePath: docPath });
   if (!plan) throw new Error(`scenario for ${docPath} unexpectedly has no excerpt plan`);
   // These scenarios only replace whole lines (no inserts/deletes), so positions align
   // across all three versions: take whichever side changed each segment line.
-  const oursLines = ours.split('\n');
-  const theirsLines = theirs.split('\n');
+  const oursLines = staged.ours.split('\n');
+  const theirsLines = staged.theirs.split('\n');
   const mergedSegment = plan.baseSegment.map((line, i) => {
     const at = plan.start - 1 + i;
     if (oursLines[at] !== line) return oursLines[at];

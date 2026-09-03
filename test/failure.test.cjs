@@ -77,7 +77,7 @@ async function stdoutAuthFailure(root) {
   assert.match(err.authSources, /CLAUDE_CONFIG_DIR/);
   const spawnLine = logs.find((m) => m.startsWith('spawning '));
   assert.ok(spawnLine, 'the spawn is logged');
-  assert.match(spawnLine, /--print --model stub/);
+  assert.match(spawnLine, /--print --bare --model stub \(no tools, no MCP;/);
   console.log('stdout auth failure test passed');
 }
 

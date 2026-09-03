@@ -152,6 +152,122 @@ function buildExcerptPlan({ base, ours, theirs, filePath }) {
   };
 }
 
+// --- Mechanical merge -----------------------------------------------------------------
+// Most divergences are the two sides editing different parts of the file, which a
+// diff3-style merge settles exactly and instantly. A model call is reserved for hunks
+// the sides genuinely dispute — and even then the model sees only those.
+
+// One side's edits as context-free hunks against the base, so each hunk's old range is
+// exactly the base lines it replaces. A pure insertion has oldLines 0 and oldStart naming
+// the base line it goes in front of (jsdiff's convention; GNU diff names the line after
+// which it goes). Both texts get a trailing newline first, or jsdiff reports a missing
+// one as a change to the last line; the trailing newline merges on its own.
+function changeHunks(base, side) {
+  const withNewline = (text) => (text.endsWith('\n') ? text : `${text}\n`);
+  return Diff.structuredPatch('', '', withNewline(base), withNewline(side), '', '', {
+    context: 0,
+  }).hunks;
+}
+
+// The base-line boundaries a hunk touches, boundary b lying between lines b and b+1: a
+// replacement of lines s..e touches s-1..e, an insertion in front of line k touches k-1.
+// Hunks from the two sides conflict when they touch a common boundary — diff3's rule that
+// edits with no unchanged line between them have no mechanical ordering.
+function touchedBoundaries(hunk) {
+  return { lo: hunk.oldStart - 1, hi: hunk.oldStart + hunk.oldLines - 1 };
+}
+
+function hunksConflict(a, b) {
+  const x = touchedBoundaries(a);
+  const y = touchedBoundaries(b);
+  return x.lo <= y.hi && y.lo <= x.hi;
+}
+
+function sameHunk(a, b) {
+  return (
+    a.oldStart === b.oldStart &&
+    a.oldLines === b.oldLines &&
+    a.lines.length === b.lines.length &&
+    a.lines.every((line, i) => line === b.lines[i])
+  );
+}
+
+// Apply pairwise non-conflicting hunks to the base lines.
+function applyHunks(baseLines, hunks) {
+  const ordered = [...hunks].sort((a, b) => a.oldStart - b.oldStart);
+  const pieces = [];
+  let cursor = 0; // base lines before this index are already placed
+  for (const hunk of ordered) {
+    const from = hunk.oldStart - 1;
+    pieces.push(baseLines.slice(cursor, from));
+    pieces.push(hunk.lines.filter((line) => line.startsWith('+')).map((line) => line.slice(1)));
+    cursor = from + hunk.oldLines;
+  }
+  pieces.push(baseLines.slice(cursor));
+  return pieces.flat();
+}
+
+// Split both sides' hunks into those a mechanical merge can apply — touching no hunk of
+// the other side, or identical to the one they touch — and the disputed remainder.
+function partitionHunks(oursHunks, theirsHunks) {
+  const settled = [];
+  const oursDisputed = [];
+  const theirsDisputed = [];
+  const duplicated = new Set(); // theirs hunks identical to an ours hunk: applied once
+  for (const ours of oursHunks) {
+    const rivals = theirsHunks.filter((theirs) => hunksConflict(ours, theirs));
+    const identical = rivals.length === 1 && sameHunk(ours, rivals[0]);
+    if (identical) duplicated.add(rivals[0]);
+    if (rivals.length === 0 || identical) settled.push(ours);
+    else oursDisputed.push(ours);
+  }
+  for (const theirs of theirsHunks) {
+    if (duplicated.has(theirs)) continue;
+    if (oursHunks.some((ours) => hunksConflict(ours, theirs))) theirsDisputed.push(theirs);
+    else settled.push(theirs);
+  }
+  return { settled, oursDisputed, theirsDisputed };
+}
+
+// Three-way merge of the trailing newline, a change the line hunks never see.
+function mergedTrailingNewline(base, ours, theirs) {
+  const baseHas = base.endsWith('\n');
+  const oursHas = ours.endsWith('\n');
+  return oursHas !== baseHas ? oursHas : theirs.endsWith('\n');
+}
+
+// Everything the sides do not dispute, applied without a model. Returns the finished
+// merge when the sides touch disjoint regions; otherwise the three versions with every
+// settled hunk applied to all of them, so a model sees only the disputed hunks. Null when
+// a side's own hunks do not rebuild that side — the hunk arithmetic does not hold for
+// this input, and the whole diff goes to the model instead.
+function mechanicalMerge({ base, ours, theirs }) {
+  const baseLines = splitLines(base).lines;
+  const oursHunks = changeHunks(base, ours);
+  const theirsHunks = changeHunks(base, theirs);
+  const rebuilds = (hunks, side) =>
+    joinLines(applyHunks(baseLines, hunks), side.endsWith('\n')) === side;
+  if (!rebuilds(oursHunks, ours) || !rebuilds(theirsHunks, theirs)) return null;
+
+  const { settled, oursDisputed, theirsDisputed } = partitionHunks(oursHunks, theirsHunks);
+  const disputed = oursDisputed.length + theirsDisputed.length;
+  if (disputed === 0) {
+    const lines = applyHunks(baseLines, settled);
+    const merged = joinLines(lines, mergedTrailingNewline(base, ours, theirs));
+    return { merged, settled: settled.length, disputed };
+  }
+  return {
+    settled: settled.length,
+    disputed,
+    base: joinLines(applyHunks(baseLines, settled), base.endsWith('\n')),
+    ours: joinLines(applyHunks(baseLines, [...settled, ...oursDisputed]), ours.endsWith('\n')),
+    theirs: joinLines(
+      applyHunks(baseLines, [...settled, ...theirsDisputed]),
+      theirs.endsWith('\n')
+    ),
+  };
+}
+
 function xmlBlock(tag, content) {
   return `<${tag}>\n${content}\n</${tag}>`;
 }
@@ -308,8 +424,27 @@ function runClaude({
     const env = { ...process.env, ...extraEnv };
     env.PATH = `${path.join(os.homedir(), '.local', 'bin')}:${env.PATH ?? ''}`;
     const authSources = describeAuthSources(env, extraEnv);
-    const args = ['--print', '--model', model, '--output-format', 'text', instruction];
-    log(`spawning ${claudePath} --print --model ${model} (cwd ${os.tmpdir()}; ${authSources})`);
+    // Bare mode: no hooks, plugins, MCP servers, LSPs, CLAUDE.md, or session files. A
+    // merge needs none of them, and together they cost ~13s and a 54k-token system prompt
+    // per call (measured 2026-09-03 on 2.1.259). Bare mode authenticates with
+    // ANTHROPIC_API_KEY only; the ~/.claude OAuth login is never read.
+    const args = [
+      '--print',
+      '--bare',
+      '--model',
+      model,
+      '--output-format',
+      'text',
+      '--tools',
+      '',
+      '--strict-mcp-config',
+      '--no-session-persistence',
+      instruction,
+    ];
+    log(
+      `spawning ${claudePath} --print --bare --model ${model} ` +
+        `(no tools, no MCP; cwd ${os.tmpdir()}; ${authSources})`
+    );
     const child = spawn(claudePath, args, {
       cwd: os.tmpdir(),
       env,
@@ -407,6 +542,26 @@ function staleError() {
   return err;
 }
 
+// The mechanical stage's verdict: the finished merge when nothing is disputed, otherwise
+// the inputs the model should see.
+function settleMechanically(opts, log) {
+  const { base, ours, theirs } = opts;
+  const outcome = base ? mechanicalMerge({ base, ours, theirs }) : null;
+  if (!outcome) {
+    if (base) log('hunk arithmetic does not hold for this input; the whole diff goes to the model');
+    return { inputs: opts };
+  }
+  if (outcome.disputed === 0) {
+    log(`merged mechanically: ${outcome.settled} hunks, none disputed; no model call`);
+    return { merged: outcome.merged };
+  }
+  log(
+    `mechanical stage settled ${outcome.settled} hunks; ` +
+      `${outcome.disputed} disputed hunks go to the model`
+  );
+  return { inputs: { ...opts, base: outcome.base, ours: outcome.ours, theirs: outcome.theirs } };
+}
+
 async function llmMerge(opts) {
   const { base, ours, theirs } = opts;
   const log = opts.log ?? (() => {});
@@ -414,12 +569,15 @@ async function llmMerge(opts) {
   if (ours === base) return theirs;
   if (theirs === base) return ours;
 
-  const plan = buildExcerptPlan(opts);
+  const { merged, inputs } = settleMechanically(opts, log);
+  if (merged !== undefined) return merged;
+
+  const plan = buildExcerptPlan(inputs);
   if (plan) {
     const pct = Math.round(((plan.end - plan.start + 1) / plan.baseCount) * 100);
     log(`excerpt merge: lines ${plan.start}-${plan.end} of ${plan.baseCount} (${pct}%)`);
     try {
-      return await mergeViaExcerpt(opts, plan);
+      return await mergeViaExcerpt(inputs, plan);
     } catch (err) {
       if (err.cancelled) throw err; // a user cancel must not trigger a second model call
       // A slow excerpt call (minutes under API degradation) leaves time for the
@@ -432,11 +590,12 @@ async function llmMerge(opts) {
       log(`excerpt merge failed (${err.message}); retrying with the full file`);
     }
   }
-  return mergeViaFullFile(opts);
+  return mergeViaFullFile(inputs);
 }
 
 module.exports = {
   llmMerge,
+  mechanicalMerge,
   parseDotenv,
   buildPayload,
   buildExcerptPlan,

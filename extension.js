@@ -105,9 +105,9 @@ function reportFailure(basename, err) {
     const minutes = AUTH_FAILURE_COOLDOWN_MS / 60000;
     message =
       `LLM Save Merge: claude is not authenticated: ${err.detail} [${err.authSources}]. ` +
-      `Run "claude auth login" in a terminal, or point llmSaveMerge.envFile at a dotenv ` +
-      `exporting ANTHROPIC_API_KEY. Auto-merges pause for ${minutes} min; the palette ` +
-      `command still runs.`;
+      `Merges run claude in bare mode, which reads only ANTHROPIC_API_KEY: point ` +
+      `llmSaveMerge.envFile at a dotenv exporting it. Auto-merges pause for ${minutes} ` +
+      `min; the palette command still runs.`;
     actions = [showLog, openSettings];
   } else if (err.config) {
     message = `LLM Save Merge: ${err.message}.`;

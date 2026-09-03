@@ -189,11 +189,16 @@ async function cancelOnEdit(workspace) {
   );
   await waitFor(() => document.getText() === expected, 15000, 'kill + re-merge with fresh text');
   assert.strictEqual(stubCalls(sc.doc).length, 2, 'killed call plus fresh call');
+  // The mid-call edit is undisputed, so the fresh merge settles it mechanically and the
+  // model's excerpt never carries it — its presence in the document is the proof.
   const secondPayload = fs.readFileSync(
     path.join(process.env.STUB_DIR, `call-${sc.doc}-1.txt`),
     'utf8'
   );
-  assert.ok(secondPayload.includes(sc.secondEdit[1]), 'fresh call carries the mid-call edit');
+  assert.ok(
+    !secondPayload.includes(sc.secondEdit[1]),
+    'the settled mid-call edit stays out of the model payload'
+  );
   console.log('scenario cancel-on-edit passed');
 }
 
