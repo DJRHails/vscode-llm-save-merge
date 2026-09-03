@@ -46,6 +46,14 @@ buffer, re-based on the new disk state. By the time you save, there is no confli
 The [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and
 authenticated on the machine where the extension host runs (the remote, for Remote-SSH).
 
+**Authenticated for the extension host, not just for your terminal.** The extension host
+runs with the VS Code server's login environment. Anything an interactive shell exports on
+top of that — an `ANTHROPIC_API_KEY` sourced by a shell function, a `CLAUDE_CONFIG_DIR`
+pointing at a second profile — never reaches the `claude` child, which then falls back to
+the default `~/.claude` login and fails if that one is missing or expired. Either keep
+`~/.claude` logged in (`claude auth login`), or point `llmSaveMerge.envFile` at a dotenv
+file exporting the credentials your shell uses (re-read on every merge).
+
 ## Settings
 
 | setting | default | meaning |
@@ -55,6 +63,7 @@ authenticated on the machine where the extension host runs (the remote, for Remo
 | `llmSaveMerge.claudePath` | `claude` | claude binary (`~/.local/bin` is added to PATH) |
 | `llmSaveMerge.timeoutMs` | `240000` | merge call timeout (full-file merges of large files are output-bound and slow) |
 | `llmSaveMerge.maxFileBytes` | `400000` | skip files larger than this |
+| `llmSaveMerge.envFile` | `""` | dotenv file added to the claude child's environment (`~` expands; `export` prefix and quotes allowed) |
 
 The command palette entry **LLM Save Merge: Merge disk changes into active file** runs a
 merge on demand (works even with `enabled` off). For a buffer that was restored dirty
@@ -62,10 +71,24 @@ from backup — where the true ancestor is unknowable and disk divergence from b
 restore is invisible to the automatic triggers — the manual command merges anyway,
 ancestor-less: the model combines buffer and disk faithfully.
 
+## When a merge fails
+
+Every failure shows a warning with the reason and a **Show log** button; the
+**LLM Save Merge** output channel carries the full record: the spawned command line and
+which credentials the child saw (names only, never values), the exit code or signal,
+and both stdout and stderr. `claude --print` reports authentication errors on **stdout**
+(observed on 2.1.259), so an "exited 1" with an empty stderr has its message there.
+
+An authentication failure (`Not logged in`, `OAuth session expired`, …) gets a dialog
+naming the fix — log `~/.claude` in with `claude auth login`, or set `envFile` — plus an
+**Open settings** button, and pauses automatic merges for 10 minutes so each disk change
+does not re-fail and re-prompt. The pause lifts on any `llmSaveMerge` settings change,
+on the first successful merge, and never applies to the palette command.
+
 ## Tests
 
 ```sh
-npm test                          # offline: span arithmetic, fallbacks, stubbed CLI
+npm test                          # offline: span arithmetic, fallbacks, failure paths, stubbed CLI
 npm run test:live                 # live: real claude CLI, both prompt shapes
 xvfb-run -a npm run test:e2e      # e2e: real VS Code, stubbed CLI, conflict-free save
 ```

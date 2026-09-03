@@ -237,12 +237,79 @@ function cancellationError() {
   return err;
 }
 
-function runClaude({ claudePath, model, timeoutMs, instruction, payload, cancellation }) {
+// Auth failures the CLI reports in --print mode. They arrive on STDOUT with exit 1 and
+// an empty stderr (observed on claude 2.1.259):
+//   "Failed to authenticate: OAuth session expired and could not be refreshed"
+//   "Not logged in · Please run /login"
+const AUTH_FAILURE_PATTERN =
+  /not logged in|failed to authenticate|oauth session expired|please run \/login|invalid api key|authentication_error/i;
+
+// Parse a dotenv file: KEY=VALUE lines, an optional `export ` prefix, single or double
+// quotes around the value (which protect a `#`), and ` #` comments after bare values.
+function parseDotenv(text) {
+  const env = {};
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const quoted = match[2].match(/^(["'])(.*?)\1(?:\s+#.*)?$/);
+    env[match[1]] = quoted ? quoted[2] : match[2].replace(/\s+#.*$/, '').trim();
+  }
+  return env;
+}
+
+// What the child will authenticate with, for the log and the failure dialog. Names
+// only — never a value.
+function describeAuthSources(env, extraEnv) {
+  let key = 'no ANTHROPIC_API_KEY';
+  if (extraEnv.ANTHROPIC_API_KEY) key = 'ANTHROPIC_API_KEY from envFile';
+  else if (env.ANTHROPIC_API_KEY) key = 'ANTHROPIC_API_KEY from the host environment';
+  const configDir = env.CLAUDE_CONFIG_DIR ?? '~/.claude (default)';
+  return `${key}; CLAUDE_CONFIG_DIR ${configDir}`;
+}
+
+function tailForMessage(text, maxChars) {
+  const trimmed = text.trim();
+  return trimmed.length > maxChars ? `…${trimmed.slice(-maxChars)}` : trimmed;
+}
+
+// The CLI puts auth and API errors on stdout in --print mode, so an empty stderr says
+// nothing on its own: fall back to the tail of stdout, where the error lands.
+function claudeFailure({ code, signal, stdout, stderr, authSources }) {
+  const exit = signal ? `was killed by ${signal}` : `exited ${code}`;
+  const detail =
+    tailForMessage(stderr, 400) ||
+    tailForMessage(stdout, 400) ||
+    '(no output on stdout or stderr)';
+  const err = new Error(`claude ${exit}: ${detail}`);
+  err.detail = detail;
+  err.exitCode = code;
+  err.signal = signal;
+  err.stdout = stdout;
+  err.stderr = stderr;
+  err.auth = AUTH_FAILURE_PATTERN.test(detail);
+  err.authSources = authSources;
+  return err;
+}
+
+function runClaude({
+  claudePath,
+  model,
+  timeoutMs,
+  instruction,
+  payload,
+  cancellation,
+  extraEnv = {},
+  log = () => {},
+}) {
   return new Promise((resolve, reject) => {
     if (cancellation?.isCancellationRequested) return reject(cancellationError());
-    const env = { ...process.env };
+    const env = { ...process.env, ...extraEnv };
     env.PATH = `${path.join(os.homedir(), '.local', 'bin')}:${env.PATH ?? ''}`;
+    const authSources = describeAuthSources(env, extraEnv);
     const args = ['--print', '--model', model, '--output-format', 'text', instruction];
+    log(`spawning ${claudePath} --print --model ${model} (cwd ${os.tmpdir()}; ${authSources})`);
     const child = spawn(claudePath, args, {
       cwd: os.tmpdir(),
       env,
@@ -273,13 +340,13 @@ function runClaude({ claudePath, model, timeoutMs, instruction, payload, cancell
       cancelSub?.dispose?.();
       reject(new Error(`failed to spawn ${claudePath}: ${err.message}`));
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
       cancelSub?.dispose?.();
       if (cancelled) return reject(cancellationError());
       if (timedOut) return reject(new Error(`claude timed out after ${timeoutMs}ms`));
       if (code !== 0) {
-        return reject(new Error(`claude exited ${code}: ${stderr.slice(0, 400)}`));
+        return reject(claudeFailure({ code, signal, stdout, stderr, authSources }));
       }
       resolve(stdout);
     });
@@ -297,6 +364,8 @@ async function mergeViaExcerpt(opts, plan) {
     instruction: EXCERPT_INSTRUCTION,
     payload: buildExcerptPayload(plan, opts.filePath),
     cancellation: opts.cancellation,
+    extraEnv: opts.extraEnv,
+    log: opts.log,
   });
   const mergedSegment = splitLines(stripWrappingFence(raw)).lines;
   const problem =
@@ -321,6 +390,8 @@ async function mergeViaFullFile(opts) {
     instruction: FULL_FILE_INSTRUCTION,
     payload,
     cancellation,
+    extraEnv: opts.extraEnv,
+    log: opts.log,
   });
   const merged = normalizeTrailingNewline(stripWrappingFence(raw), ours, theirs);
   const problem = validateMerged(merged, ours, theirs);
@@ -366,6 +437,7 @@ async function llmMerge(opts) {
 
 module.exports = {
   llmMerge,
+  parseDotenv,
   buildPayload,
   buildExcerptPlan,
   buildExcerptPayload,

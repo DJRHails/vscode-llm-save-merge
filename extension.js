@@ -5,12 +5,15 @@ const vscode = require('vscode');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { llmMerge } = require('./merge');
+const { llmMerge, parseDotenv } = require('./merge');
 
 const DEBOUNCE_MS = 1200;
 const SELF_SAVE_SUPPRESS_MS = 2500;
 const MAX_STALE_RETRIES = 2;
 const POLL_MS = 2000;
+// After claude fails to authenticate, every further auto-merge would fail the same way
+// and pop the same dialog on each disk change; pause them until the user acts.
+const AUTH_FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
 
 const output = vscode.window.createOutputChannel('LLM Save Merge');
 
@@ -29,6 +32,7 @@ const lastMtimes = new Map();
 const provisionalBases = new Set();
 let pollTimer;
 let pollInFlight = false;
+let authFailedAt = 0; // epoch ms of the last claude auth failure; 0 when auth is fine
 
 function log(message) {
   output.appendLine(`[${new Date().toISOString()}] ${message}`);
@@ -40,9 +44,91 @@ function config() {
     enabled: cfg.get('enabled', true),
     model: cfg.get('model', 'claude-sonnet-5'),
     claudePath: cfg.get('claudePath', 'claude'),
-    timeoutMs: cfg.get('timeoutMs', 120000),
+    timeoutMs: cfg.get('timeoutMs', 240000),
     maxFileBytes: cfg.get('maxFileBytes', 400000),
+    envFile: cfg.get('envFile', ''),
   };
+}
+
+// The extension host inherits the VS Code server's login environment, not the user's
+// interactive shell: anything a shell function or rc file exports (an API key, a
+// CLAUDE_CONFIG_DIR) is missing here, and the claude child then fails to authenticate.
+// An optional dotenv file bridges that gap; it is re-read on every merge so edits apply
+// without a reload. A configured file that cannot be read is an error, not a silent
+// fall-through to an unauthenticated call.
+function loadExtraEnv(envFile, basename) {
+  if (!envFile) return {};
+  const resolved = envFile.replace(/^~(?=$|[\\/])/, os.homedir());
+  let text;
+  try {
+    text = fs.readFileSync(resolved, 'utf8');
+  } catch (err) {
+    const problem = new Error(
+      `llmSaveMerge.envFile ${resolved} is not readable (${err.code ?? err.message})`
+    );
+    problem.config = true;
+    throw problem;
+  }
+  const extraEnv = parseDotenv(text);
+  const names = Object.keys(extraEnv);
+  log(`${basename}: envFile ${resolved} sets ${names.length ? names.join(', ') : 'nothing'}`);
+  return extraEnv;
+}
+
+function excerptForLog(text) {
+  const trimmed = (text ?? '').trim();
+  if (!trimmed) return '(empty)';
+  const limit = 2000;
+  if (trimmed.length <= limit) return trimmed;
+  return `(${trimmed.length} chars; last ${limit})\n${trimmed.slice(-limit)}`;
+}
+
+// Every failure lands in the output channel in full (exit code, both streams, the
+// credentials the child saw) and in a dialog that says what to do about it.
+function reportFailure(basename, err) {
+  const showLog = 'Show log';
+  const openSettings = 'Open settings';
+  log(`${basename}: merge failed: ${err.message}`);
+  if (err.exitCode !== undefined) {
+    log(`  ${err.signal ? `killed by ${err.signal}` : `exit code ${err.exitCode}`}`);
+    log(`  auth: ${err.authSources}`);
+    log(`  stderr: ${excerptForLog(err.stderr)}`);
+    log(`  stdout: ${excerptForLog(err.stdout)}`);
+  } else if (!err.config) {
+    log(`  ${err.stack ?? err}`);
+  }
+
+  let message;
+  let actions;
+  if (err.auth) {
+    authFailedAt = Date.now();
+    const minutes = AUTH_FAILURE_COOLDOWN_MS / 60000;
+    message =
+      `LLM Save Merge: claude is not authenticated: ${err.detail} [${err.authSources}]. ` +
+      `Run "claude auth login" in a terminal, or point llmSaveMerge.envFile at a dotenv ` +
+      `exporting ANTHROPIC_API_KEY. Auto-merges pause for ${minutes} min; the palette ` +
+      `command still runs.`;
+    actions = [showLog, openSettings];
+  } else if (err.config) {
+    message = `LLM Save Merge: ${err.message}.`;
+    actions = [showLog, openSettings];
+  } else {
+    message =
+      `LLM Save Merge failed for ${basename}: ${err.message}. ` +
+      `VS Code's normal conflict dialog will apply on save.`;
+    actions = [showLog];
+  }
+  vscode.window.showWarningMessage(message, ...actions).then((choice) => {
+    if (choice === showLog) output.show(true);
+    if (choice === openSettings) {
+      vscode.commands.executeCommand('workbench.action.openSettings', 'llmSaveMerge');
+    }
+  });
+}
+
+function authPauseRemainingMs() {
+  if (!authFailedAt) return 0;
+  return Math.max(0, AUTH_FAILURE_COOLDOWN_MS - (Date.now() - authFailedAt));
 }
 
 function isMergeableDocument(doc) {
@@ -222,6 +308,14 @@ async function handleDiskChange(key, attempt, manual = false) {
     log(`${basename}: exceeds maxFileBytes (${cfg.maxFileBytes}); skipping`);
     return;
   }
+  const pauseMs = manual ? 0 : authPauseRemainingMs();
+  if (pauseMs > 0) {
+    log(
+      `${basename}: auto-merge paused after a claude auth failure ` +
+        `(${Math.ceil(pauseMs / 60000)} min left); fix auth, then use the palette command`
+    );
+    return;
+  }
   const alreadyRunning = inFlight.get(key);
   if (alreadyRunning) {
     pendingRerun.add(key);
@@ -258,11 +352,7 @@ async function handleDiskChange(key, attempt, manual = false) {
     } else if (err.stale) {
       retryLater(key, attempt, 'inputs went stale during the merge', basename, manual);
     } else {
-      log(`${basename}: merge failed: ${err.stack ?? err}`);
-      vscode.window.showWarningMessage(
-        `LLM Save Merge failed for ${basename} (${err.message}). ` +
-          `VS Code's normal conflict dialog will apply on save.`
-      );
+      reportFailure(basename, err);
     }
   } finally {
     inFlight.delete(key);
@@ -341,6 +431,7 @@ async function performMerge({
 }) {
   const versionBefore = doc.version;
   log(`${basename}: merging (base ${base.length}B, ours ${ours.length}B, theirs ${theirs.length}B)`);
+  const extraEnv = loadExtraEnv(cfg.envFile, basename);
 
   const merged = await llmMerge({
     base,
@@ -350,6 +441,7 @@ async function performMerge({
     model: cfg.model,
     claudePath: cfg.claudePath,
     timeoutMs: cfg.timeoutMs,
+    extraEnv,
     cancellation,
     isStale: async () => {
       if (doc.isClosed || doc.version !== versionBefore) return true;
@@ -370,6 +462,7 @@ async function performMerge({
   // replace below (which fire change events) cannot kill their own merge. Staleness
   // from here on is handled by the version and disk checks.
   if (running) running.cancelStale = null;
+  authFailedAt = 0; // the model answered, so credentials work again
 
   if (doc.isClosed) return;
   if (doc.version !== versionBefore) {
@@ -517,6 +610,13 @@ function activate(context) {
         .catch(() => {});
     }),
     vscode.workspace.onDidCloseTextDocument((doc) => dropFileState(doc.uri.toString())),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('llmSaveMerge') || !authFailedAt) return;
+      // A settings change is the user acting on the auth dialog: let the next
+      // auto-merge try the new configuration instead of waiting out the pause.
+      authFailedAt = 0;
+      log('configuration changed; auth pause cleared');
+    }),
     vscode.commands.registerCommand('llmSaveMerge.mergeActiveFile', mergeActiveFile)
   );
   log('activated (watcher + watch-start check + mtime poll)');

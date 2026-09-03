@@ -2,10 +2,10 @@
   "name": "llm-save-merge",
   "displayName": "LLM Save Merge",
   "description": "When a file changes on disk underneath an unsaved editor buffer, 3-way merge the two versions with an LLM instead of surfacing VS Code's save-conflict dialog.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "DJRHails",
   "scripts": {
-    "test": "node test/excerpt.test.cjs",
+    "test": "node test/excerpt.test.cjs && node test/failure.test.cjs",
     "test:live": "node test/merge-live.test.cjs",
     "test:e2e": "node test/e2e/run.cjs"
   },
@@ -58,6 +58,11 @@
           "type": "number",
           "default": 400000,
           "description": "Skip files larger than this (bytes); the normal conflict dialog applies instead."
+        },
+        "llmSaveMerge.envFile": {
+          "type": "string",
+          "default": "",
+          "description": "Optional dotenv file (KEY=VALUE lines; `export` prefix and quotes allowed; `~` expands) whose variables are added to the claude child's environment, e.g. one exporting ANTHROPIC_API_KEY. The extension host runs with the VS Code server's login environment, so anything an interactive shell function exports never reaches claude without this. Re-read on every merge."
         }
       }
     }
