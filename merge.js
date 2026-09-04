@@ -96,6 +96,23 @@ function sideSegment(sideLines, start, end, baseCount) {
   return sideLines.slice(start - 1, end + sideLines.length - baseCount);
 }
 
+// The excerpt's edges: padded beyond the hunks, then moved onto non-blank lines. Models
+// trim blank lines from the ends of their output, and an edge anchor the reply cannot
+// reproduce sends every such merge to the full-file fallback (observed 2026-09-03: an
+// excerpt ending on the blank line after a `---` came back without it). Extend outward
+// to the nearest non-blank line; at a file edge that is all blank, shrink inward instead,
+// leaving no anchor there rather than an unreproducible one.
+function anchorEdges(lines, hunksStart, hunksEnd) {
+  const blank = (lineNo) => lines[lineNo - 1].trim() === '';
+  let start = Math.max(1, hunksStart - SPAN_PAD);
+  while (start > 1 && blank(start)) start -= 1;
+  while (start < hunksStart && blank(start)) start += 1;
+  let end = Math.min(lines.length, hunksEnd + SPAN_PAD);
+  while (end < lines.length && blank(end)) end += 1;
+  while (end > hunksEnd && blank(end)) end -= 1;
+  return { start, end };
+}
+
 // Everything needed to merge via excerpt + diffs, or null when excerpt mode does not
 // apply (unknown ancestor, or the changed span covers most of the file).
 function buildExcerptPlan({ base, ours, theirs, filePath }) {
@@ -115,8 +132,7 @@ function buildExcerptPlan({ base, ours, theirs, filePath }) {
   const theirsSpan = changedSpan(theirsPatch.hunks);
   const hunksStart = Math.min(oursSpan.start, theirsSpan.start);
   const hunksEnd = Math.max(oursSpan.end, theirsSpan.end);
-  const start = Math.max(1, hunksStart - SPAN_PAD);
-  const end = Math.min(baseCount, hunksEnd + SPAN_PAD);
+  const { start, end } = anchorEdges(baseSplit.lines, hunksStart, hunksEnd);
   if ((end - start + 1) / baseCount > SPAN_MAX_RATIO) return null;
 
   const oursSplit = splitLines(ours);

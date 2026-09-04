@@ -32,7 +32,9 @@ buffer, re-based on the new disk state. By the time you save, there is no confli
   invariant checks the splice arithmetic: each side's own segment spliced into the
   original must reproduce that side byte-for-byte. Unknown ancestors, disputes spanning
   most of the file, a failed invariant, or a rejected excerpt (edge context lines must
-  survive verbatim) fall back to the full three-version prompt.
+  survive verbatim) fall back to the full three-version prompt. The excerpt's edges
+  always sit on non-blank lines — models trim blank lines from the ends of their
+  output, and a blank edge anchor would send every such merge to the fallback.
 - **A lean model call**: `claude` runs in `--bare` mode with no tools, MCP servers,
   hooks, plugins, or CLAUDE.md — a merge needs none of them, and together they had cost
   ~13 s and a 54k-token system prompt per call.

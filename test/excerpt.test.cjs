@@ -105,6 +105,40 @@ function planTests() {
   });
   assert.ok(bareplan, 'file without trailing newline still plans');
 
+  // Excerpt edges move onto non-blank lines: models trim blank lines from the ends of
+  // their output, and a blank edge anchor would be refused on every reply.
+  const blankEdges = withEdit(withEdit(base, 9, ''), 21, '');
+  const blankPlan = buildExcerptPlan({
+    base: blankEdges,
+    ours: withEdit(blankEdges, 15, 'line 15 ours'),
+    theirs: withEdit(blankEdges, 15, 'line 15 theirs'),
+    filePath: '/tmp/a.txt',
+  });
+  assert.strictEqual(blankPlan.start, 8, 'start extends past the blank line 9');
+  assert.strictEqual(blankPlan.end, 22, 'end extends past the blank line 21');
+  assert.strictEqual(blankPlan.leadAnchor, 4);
+  assert.strictEqual(blankPlan.trailAnchor, 4);
+
+  // At a blank file edge the pad shrinks inward instead, leaving no anchor there.
+  const blankTail = withEdit(withEdit(base, 59, ''), 60, '');
+  const tailPlan = buildExcerptPlan({
+    base: blankTail,
+    ours: withEdit(blankTail, 55, 'line 55 ours'),
+    theirs: withEdit(blankTail, 55, 'line 55 theirs'),
+    filePath: '/tmp/a.txt',
+  });
+  assert.strictEqual(tailPlan.end, 58, 'end shrinks onto the last non-blank line');
+  assert.strictEqual(tailPlan.trailAnchor, 0);
+  const blankHead = withEdit(withEdit(base, 1, ''), 2, '');
+  const headPlan = buildExcerptPlan({
+    base: blankHead,
+    ours: withEdit(blankHead, 6, 'line 6 ours'),
+    theirs: withEdit(blankHead, 6, 'line 6 theirs'),
+    filePath: '/tmp/a.txt',
+  });
+  assert.strictEqual(headPlan.start, 3, 'start shrinks onto the first non-blank line');
+  assert.strictEqual(headPlan.leadAnchor, 0);
+
   console.log('plan tests passed');
 }
 
@@ -320,6 +354,36 @@ async function stubbedRoundTrip(stubRoot) {
   console.log('stubbed excerpt round-trip passed');
 }
 
+// Models trim blank lines from the ends of their output. With the plan's edges on
+// non-blank lines, such a reply passes the anchor check — no full-file fallback.
+async function stubbedTrimmedReply(stubRoot) {
+  const stubDir = fs.mkdtempSync(path.join(stubRoot, 'trimmed-'));
+  process.env.STUB_DIR = stubDir;
+  const base = withEdit(withEdit(numberedFile(40), 9, ''), 21, '');
+  const { ours, theirs, expected } = disputedEdits(base);
+  const plan = modelPlan(base, ours, theirs);
+  const reply = plan.baseSegment
+    .map((line) => (line === 'line 15' ? 'line 15 ours' : line))
+    .join('\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '');
+  fs.writeFileSync(path.join(stubDir, 'reply-0.txt'), `${reply}\n`);
+
+  const merged = await llmMerge({
+    base,
+    ours,
+    theirs,
+    filePath: '/tmp/doc.md',
+    model: 'stub',
+    claudePath: makeStub(stubDir),
+    timeoutMs: 10000,
+  });
+  assert.strictEqual(merged, expected, 'edge-trimmed reply accepted');
+  const calls = fs.readdirSync(stubDir).filter((f) => f.startsWith('call-'));
+  assert.strictEqual(calls.length, 1, 'no full-file fallback call');
+  console.log('trimmed-reply test passed');
+}
+
 async function stubbedAnchorFallback(stubRoot) {
   const stubDir = fs.mkdtempSync(path.join(stubRoot, 'fallback-'));
   process.env.STUB_DIR = stubDir;
@@ -458,6 +522,7 @@ async function main() {
   try {
     gitOracleTest(stubRoot);
     await stubbedRoundTrip(stubRoot);
+    await stubbedTrimmedReply(stubRoot);
     await stubbedAnchorFallback(stubRoot);
     await stubbedTagLeakFallback(stubRoot);
     await stubbedStaleAbort(stubRoot);
