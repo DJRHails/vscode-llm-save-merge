@@ -47,7 +47,7 @@ function unitTests() {
 }
 
 const liveOpts = {
-  model: process.env.LLM_SAVE_MERGE_MODEL || 'claude-sonnet-5',
+  model: process.env.LLM_SAVE_MERGE_MODEL || 'claude-sonnet-5-5',
   claudePath: process.env.LLM_SAVE_MERGE_CLAUDE || 'claude',
   timeoutMs: 120000,
 };
