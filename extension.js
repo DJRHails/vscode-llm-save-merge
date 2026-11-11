@@ -42,7 +42,7 @@ function config() {
   const cfg = vscode.workspace.getConfiguration('llmSaveMerge');
   return {
     enabled: cfg.get('enabled', true),
-    model: cfg.get('model', 'claude-sonnet-5'),
+    model: cfg.get('model', 'claude-sonnet-5-5'),
     claudePath: cfg.get('claudePath', 'claude'),
     timeoutMs: cfg.get('timeoutMs', 240000),
     maxFileBytes: cfg.get('maxFileBytes', 400000),

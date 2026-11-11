@@ -72,7 +72,7 @@ shell uses (re-read on every merge), or export it in the login environment itsel
 | setting | default | meaning |
 | --- | --- | --- |
 | `llmSaveMerge.enabled` | `true` | auto-merge on disk divergence |
-| `llmSaveMerge.model` | `claude-sonnet-5` | model id for `claude --print --bare --model` |
+| `llmSaveMerge.model` | `claude-sonnet-5-5` | model id for `claude --print --bare --model` |
 | `llmSaveMerge.claudePath` | `claude` | claude binary (`~/.local/bin` is added to PATH) |
 | `llmSaveMerge.timeoutMs` | `240000` | merge call timeout (full-file merges of large files are output-bound and slow) |
 | `llmSaveMerge.maxFileBytes` | `400000` | skip files larger than this |
