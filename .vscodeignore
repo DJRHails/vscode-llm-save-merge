@@ -2,3 +2,5 @@ test/
 .gitignore
 *.vsix
 .vscode-test/
+.github/
+.data/
