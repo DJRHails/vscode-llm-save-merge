@@ -162,9 +162,12 @@ function journal(filePath, versions) {
   return written;
 }
 
+// Per-document state is dropped on close, and nothing drops it again. Async callbacks
+// (a disk read or stat started while the document was open) can resolve after that
+// close, so every write of per-document state checks the document is still open.
 function ensureWatcher(doc) {
   const key = doc.uri.toString();
-  if (watchers.has(key)) return;
+  if (doc.isClosed || watchers.has(key)) return;
   const pattern = new vscode.RelativePattern(
     path.dirname(doc.uri.fsPath),
     path.basename(doc.uri.fsPath)
@@ -180,7 +183,9 @@ function ensureWatcher(doc) {
   watchers.set(key, watcher);
   log(`${path.basename(doc.uri.fsPath)}: watching for disk changes`);
   vscode.workspace.fs.stat(doc.uri).then(
-    (stat) => lastMtimes.set(key, stat.mtime),
+    (stat) => {
+      if (watchers.get(key) === watcher) lastMtimes.set(key, stat.mtime);
+    },
     () => {}
   );
   // The disk may already have diverged before this watcher existed (a buffer restored
@@ -189,7 +194,9 @@ function ensureWatcher(doc) {
 }
 
 // Record an authoritative base: buffer text known to match a real disk state.
-function settleBase(key, text) {
+function settleBase(doc, text) {
+  if (doc.isClosed) return;
+  const key = doc.uri.toString();
   baseSnapshots.set(key, text);
   provisionalBases.delete(key);
 }
@@ -284,7 +291,7 @@ async function handleDiskChange(key, attempt, manual = false) {
   const ours = doc.getText();
   if (theirs === ours) {
     log(`${basename}: buffer already matches disk; re-basing`);
-    settleBase(key, theirs);
+    settleBase(doc, theirs);
     return;
   }
   let base = baseSnapshots.get(key) ?? '';
@@ -492,7 +499,7 @@ async function rebaseBufferOnDisk(doc, key, theirs, ours) {
     await vscode.window.showTextDocument(doc, { preview: false });
     await vscode.commands.executeCommand('workbench.action.files.revert');
   }
-  settleBase(key, theirs);
+  settleBase(doc, theirs);
 }
 
 async function replaceAll(doc, text) {
@@ -538,7 +545,7 @@ function trackDocument(doc) {
   if (!isMergeableDocument(doc)) return;
   const key = doc.uri.toString();
   if (!doc.isDirty) {
-    settleBase(key, doc.getText());
+    settleBase(doc, doc.getText());
     return;
   }
   // Dirty before we ever saw a clean version (restored from backup, or already dirty
@@ -547,6 +554,7 @@ function trackDocument(doc) {
   // read the user's edits as "no change on our side" and resolve to plain disk.
   readDisk(doc.uri)
     .then((disk) => {
+      if (doc.isClosed) return;
       if (!baseSnapshots.has(key)) {
         baseSnapshots.set(key, disk);
         provisionalBases.add(key);
@@ -568,7 +576,7 @@ function activate(context) {
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!isMergeableDocument(doc)) return;
       const key = doc.uri.toString();
-      settleBase(key, doc.getText());
+      settleBase(doc, doc.getText());
       suppressUntil.set(key, Date.now() + SELF_SAVE_SUPPRESS_MS);
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
@@ -594,7 +602,7 @@ function activate(context) {
       if (event.contentChanges.length === 0) {
         // An empty change on a clean document is a dirty-state flip (save, revert,
         // undo back to saved): buffer equals disk, safe to re-base directly.
-        settleBase(key, text);
+        settleBase(doc, text);
         return;
       }
       // A content change on a "clean" document is ambiguous: a real edit can arrive
@@ -605,7 +613,7 @@ function activate(context) {
       // buffers, false for the mid-transition edit event).
       readDisk(doc.uri)
         .then((disk) => {
-          if (disk === text) settleBase(key, text);
+          if (disk === text) settleBase(doc, text);
         })
         .catch(() => {});
     }),
